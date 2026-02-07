@@ -85,21 +85,10 @@ impl Raft {
                     }
                 },
                 _ = election_timer.tick() => {
-                    tracing::info!(node = self.id, "Election timer tick");
+                    self.handle_heartbeat_timeout().await;
                 },
                 _ = heartbeat_timer.tick() => {
-                    tracing::info!(node = self.id, "Heartbeat timer tick");
-                    for (&peer_id, peer) in &self.peers {
-                        let req = AppendEntriesRequest {
-                            ..Default::default()
-                        };
-                        let peer = peer.clone();
-                        let id = self.id;
-                        tokio::spawn(async move {
-                            let resp = peer.append_entries(req).await;
-                            tracing::info!(node = id, peer = peer_id, "Got append entries response: {:?}", resp);
-                        });
-                    }
+                    self.handle_election_timeout().await;
                 }
             }
         }
@@ -121,6 +110,25 @@ impl Raft {
     pub async fn handle_install_snapshot(&mut self, _: InstallSnapshotRequest) -> InstallSnapshotResponse {
         InstallSnapshotResponse {
             term: self.term,
+        }
+    }
+
+    pub async fn handle_heartbeat_timeout(&mut self) {
+        tracing::info!(node = self.id, "Heartbeat timeout");
+    }
+
+    pub async fn handle_election_timeout(&mut self) {
+        tracing::info!(node = self.id, "Heartbeat timer tick");
+        for (&peer_id, peer) in &self.peers {
+            let req = AppendEntriesRequest {
+                ..Default::default()
+            };
+            let peer = peer.clone();
+            let id = self.id;
+            tokio::spawn(async move {
+                let resp = peer.append_entries(req).await;
+                tracing::info!(node = id, peer = peer_id, "Got append entries response: {:?}", resp);
+            });
         }
     }
 
