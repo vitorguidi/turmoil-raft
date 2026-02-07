@@ -4,7 +4,7 @@ use crate::pb::raft::{AppendEntriesRequest, AppendEntriesResponse, RequestVoteRe
 use tonic::transport::Channel;
 use tonic::Status;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RaftClient {
     inner: TonicRaftClient<Channel>,
 }

@@ -14,6 +14,7 @@ use common::*;
 #[test]
 fn ping_test() -> turmoil::Result {
     let _ = tracing_subscriber::fmt().without_time().try_init();
+    const MAX_STEPS: u32 = 1000000;
 
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(200))
@@ -66,7 +67,7 @@ fn ping_test() -> turmoil::Result {
     }
 
     // Step the simulation manually since server hosts never return.
-    for _ in 0..5000 {
+    for _ in 0..MAX_STEPS {
         sim.step()?;
     }
 
