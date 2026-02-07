@@ -34,7 +34,7 @@ impl Raft {
         let mut election_timer = tokio::time::interval(std::time::Duration::from_millis(300));
         let mut heartbeat_timer = tokio::time::interval(std::time::Duration::from_millis(150));
         loop {
-            tokio::select! {
+            tokio::select! { biased;
                 Some(msg) = self.rx.recv() => {
                     match msg {
                         RaftMsg::AppendEntries {req, reply} => {

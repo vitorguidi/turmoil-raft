@@ -5,19 +5,22 @@ use tonic::transport::Server;
 use turmoil_raft::pb::raft::raft_client::RaftClient as TonicRaftClient;
 use turmoil_raft::pb::raft::raft_server::RaftServer;
 use turmoil_raft::raft::{client::RaftClient, core::Raft, rpc::RaftService};
+use rand::rngs::SmallRng;
+use rand::SeedableRng;
 
 mod common;
 use common::*;
 
 #[test]
 fn ping_test() -> turmoil::Result {
-    let _ = tracing_subscriber::fmt().try_init();
+    let _ = tracing_subscriber::fmt().without_time().try_init();
 
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(200))
         .fail_rate(0.0)
-        .build();
-
+        .enable_random_order()
+        .build_with_rng(Box::new(SmallRng::seed_from_u64(42)));
+    
     let servers: Vec<_> = (1..=3).map(|i| format!("server-{}", i)).collect();
 
     for (i, server_name) in servers.iter().enumerate() {
