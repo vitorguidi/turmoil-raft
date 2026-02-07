@@ -4,7 +4,7 @@ use tokio::sync::mpsc;
 use tonic::transport::Server;
 use turmoil_raft::pb::raft::raft_client::RaftClient as TonicRaftClient;
 use turmoil_raft::pb::raft::raft_server::RaftServer;
-use turmoil_raft::raft::{client::RaftClient, core::Raft, rpc::RaftService};
+use turmoil_raft::raft::{client::RaftClient, core::{Raft, RaftState, Role}, rpc::RaftService};
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
 use std::sync::{Arc, Mutex};
@@ -15,7 +15,7 @@ use common::*;
 #[test]
 fn ping_test() -> turmoil::Result {
     let _ = tracing_subscriber::fmt().without_time().try_init();
-    const MAX_STEPS: u32 = 10000;
+    const MAX_STEPS: u32 = 10000000;
 
     let rng = Arc::new(Mutex::new(SmallRng::seed_from_u64(42)));
 
@@ -26,14 +26,21 @@ fn ping_test() -> turmoil::Result {
         .build_with_rng(Box::new(SmallRng::seed_from_u64(42)));
 
     let servers: Vec<_> = (1..=3).map(|i| format!("server-{}", i)).collect();
+    let mut state_handles = Vec::new();
 
     for (i, server_name) in servers.iter().enumerate() {
         let servers = servers.clone();
         let server_name = server_name.clone();
         let rng = rng.clone();
+
+        // Create shared state for this node
+        let state = Arc::new(Mutex::new(RaftState::new()));
+        state_handles.push(state.clone());
+
         sim.host(server_name.as_str(), move || {
             let servers = servers.clone();
             let rng = rng.clone();
+            let state = state.clone();
             async move {
                 let self_id = i as u64 + 1;
                 let (tx, rx) = mpsc::channel(100);
@@ -65,16 +72,19 @@ fn ping_test() -> turmoil::Result {
 
                 // Run the Raft core directly so the host stays alive
                 // (turmoil stops polling spawned tasks once the host closure returns).
-                Raft::new(self_id, tx, rx, peers, rng, 150, 300, 150).run().await;
+                Raft::new(self_id, tx, rx, peers, rng, 150, 300, 150, state).run().await;
 
                 Ok(())
             }
         });
     }
 
+    let oracle = Oracle::new(state_handles);
+
     // Step the simulation manually since server hosts never return.
-    for _ in 0..MAX_STEPS {
+    for step in 0..MAX_STEPS {
         sim.step()?;
+        oracle.assert_invariants();
     }
 
     Ok(())

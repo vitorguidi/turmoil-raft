@@ -10,11 +10,34 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use rand::rngs::SmallRng;
 
-#[derive(Debug, PartialEq)]
-pub enum RaftState {
-    FOLLOWER,
-    CANDIDATE,
-    LEADER,
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum Role {
+    Follower,
+    Candidate,
+    Leader,
+}
+
+#[derive(Debug)]
+pub struct RaftState {
+    pub term: u64,
+    pub voted_for: Option<u64>,
+    pub role: Role,
+    pub log: Vec<LogEntry>,
+    pub commit_index: u64,
+    pub last_applied: u64,
+}
+
+impl RaftState {
+    pub fn new() -> Self {
+        Self {
+            term: 0,
+            voted_for: None,
+            role: Role::Follower,
+            log: Vec::new(),
+            commit_index: 0,
+            last_applied: 0,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -42,7 +65,6 @@ pub enum RaftMsg {
 #[derive(Debug)]
 pub struct Raft {
     pub id: u64,
-    state: RaftState,
     received_votes: u64,
     tx: mpsc::Sender<RaftMsg>,
     rx: mpsc::Receiver<RaftMsg>,
@@ -52,13 +74,8 @@ pub struct Raft {
     heartbeat_interval: u64,
     election_interval: u64,
     election_jitter: u64,
-    // Persistent state on all servers
-    pub term: u64,
-    voted_for: Option<u64>,
-    log: Vec<LogEntry>,
-    // Volatile state on all servers
-    commit_index: u64,
-    last_applied: u64,
+    // Shared state for oracle inspection
+    pub core: Arc<Mutex<RaftState>>,
     // Volatile leader state
     next_index: Vec<u64>,
     match_index: Vec<u64>,
@@ -74,11 +91,11 @@ impl Raft {
         heartbeat_interval: u64,
         election_interval: u64,
         election_jitter: u64,
+        core: Arc<Mutex<RaftState>>,
     ) -> Self {
         let nr_peers = peers.len();
         Self {
             id,
-            state: RaftState::FOLLOWER,
             received_votes: 0,
             tx,
             rx,
@@ -88,11 +105,7 @@ impl Raft {
             election_interval,
             election_jitter,
             heartbeat_interval,
-            term: 0,
-            voted_for: None,
-            log: Vec::new(),
-            commit_index: 0,
-            last_applied: 0,
+            core,
             next_index: vec![0; nr_peers + 1],
             match_index: vec![0; nr_peers + 1],
         }
@@ -138,95 +151,113 @@ impl Raft {
     // -- RPC handlers --
 
     fn handle_append_entries_req(&mut self, req: AppendEntriesRequest) -> AppendEntriesResponse {
+        let core_arc = self.core.clone();
+        let mut core = core_arc.lock().unwrap();
         tracing::info!(node = self.id, leader = req.leader_id, term = req.term, "Received AppendEntries");
 
-        if req.term < self.term {
+        if req.term < core.term {
             return AppendEntriesResponse {
-                term: self.term,
+                term: core.term,
                 ..Default::default()
             };
         }
 
         self.reset_election_timeout();
 
-        if req.term > self.term || self.state != RaftState::FOLLOWER {
-            self.become_follower(req.term);
+        if req.term > core.term || core.role != Role::Follower {
+            self.become_follower(&mut core, req.term);
         }
 
         // TODO: log consistency check, append entries, advance commit_index
         AppendEntriesResponse {
-            term: self.term,
+            term: core.term,
             success: true,
             ..Default::default()
         }
     }
 
     fn handle_request_vote_req(&mut self, req: RequestVoteRequest) -> RequestVoteResponse {
-        if req.term < self.term {
+        let core_arc = self.core.clone();
+        let mut core = core_arc.lock().unwrap();
+        if req.term < core.term {
             return RequestVoteResponse {
-                term: self.term,
+                term: core.term,
                 vote_granted: false,
             };
         }
 
-        if req.term > self.term {
-            self.become_follower(req.term);
+        if req.term > core.term {
+            self.become_follower(&mut core, req.term);
         }
 
-        let can_vote = self.voted_for.is_none() || self.voted_for == Some(req.candidate_id);
+        let can_vote = core.voted_for.is_none() || core.voted_for == Some(req.candidate_id);
 
         if can_vote {
-            self.voted_for = Some(req.candidate_id);
+            core.voted_for = Some(req.candidate_id);
             self.reset_election_timeout();
             tracing::info!(node = self.id, candidate = req.candidate_id, term = req.term, "Granting vote");
             RequestVoteResponse {
-                term: self.term,
+                term: core.term,
                 vote_granted: true,
             }
         } else {
             RequestVoteResponse {
-                term: self.term,
+                term: core.term,
                 vote_granted: false,
             }
         }
     }
 
     fn handle_install_snapshot_req(&mut self, _: InstallSnapshotRequest) -> InstallSnapshotResponse {
+        let core = self.core.lock().unwrap();
         InstallSnapshotResponse {
-            term: self.term,
+            term: core.term,
         }
     }
 
     // -- election --
 
     fn handle_request_vote_resp(&mut self, peer_id: u64, resp: RequestVoteResponse) {
-        if self.state != RaftState::CANDIDATE {
-            return;
-        }
-        if resp.term > self.term {
-            self.become_follower(resp.term);
-            self.reset_election_timeout();
-            return;
-        }
-        if resp.vote_granted {
-            self.received_votes += 1;
-            tracing::info!(node = self.id, peer = peer_id, votes = self.received_votes, quorum = self.quorum(), "Vote granted");
-            if self.received_votes >= self.quorum() as u64 {
-                self.become_leader();
-                self.send_heartbeats();
+        let mut become_leader = false;
+        {
+            let core_arc = self.core.clone();
+            let mut core = core_arc.lock().unwrap();
+            if core.role != Role::Candidate {
+                return;
             }
+            if resp.term > core.term {
+                self.become_follower(&mut core, resp.term);
+                self.reset_election_timeout();
+                return;
+            }
+            if resp.vote_granted {
+                self.received_votes += 1;
+                tracing::info!(node = self.id, peer = peer_id, votes = self.received_votes, quorum = self.quorum(), "Vote granted");
+                if self.received_votes >= self.quorum() as u64 {
+                    self.become_leader(&mut core);
+                    become_leader = true;
+                }
+            }
+        }
+        if become_leader {
+            self.send_heartbeats();
         }
     }
 
     fn handle_election_timeout(&mut self) {
-        if self.state == RaftState::LEADER {
+        let core_arc = self.core.clone();
+        let mut core = core_arc.lock().unwrap();
+        if core.role == Role::Leader {
             return;
         }
-        self.become_candidate();
-        tracing::info!(node = self.id, term = self.term, "Starting election");
+        self.become_candidate(&mut core);
+        let term = core.term;
+        drop(core); // Drop lock before spawning tasks
+
+        tracing::info!(node = self.id, term = term, "Starting election");
 
         let req = RequestVoteRequest {
-            term: self.term,
+            term,
             candidate_id: self.id,
             ..Default::default()
         };
@@ -251,18 +282,25 @@ impl Raft {
     // -- heartbeats --
 
     fn handle_heartbeat_timeout(&mut self) {
-        if self.state != RaftState::LEADER {
+        let core = self.core.lock().unwrap();
+        if core.role != Role::Leader {
             return;
         }
+        drop(core);
         self.send_heartbeats();
     }
 
     fn send_heartbeats(&self) {
+        let core = self.core.lock().unwrap();
+        let term = core.term;
+        let commit_index = core.commit_index;
+        drop(core);
+
         for (&peer_id, peer) in &self.peers {
             let req = AppendEntriesRequest {
-                term: self.term,
+                term,
                 leader_id: self.id,
-                leader_commit: self.commit_index,
+                leader_commit: commit_index,
                 ..Default::default()
             };
             let peer = peer.clone();
@@ -291,23 +329,23 @@ impl Raft {
         self.election_timeout.as_mut().reset(Instant::now() + Duration::from_millis(timeout));
     }
 
-    fn become_follower(&mut self, term: u64) {
+    fn become_follower(&mut self, core: &mut RaftState, term: u64) {
         tracing::info!(node = self.id, term, "Becoming follower");
-        self.state = RaftState::FOLLOWER;
-        self.term = term;
-        self.voted_for = None;
+        core.role = Role::Follower;
+        core.term = term;
+        core.voted_for = None;
         self.received_votes = 0;
     }
 
-    fn become_candidate(&mut self) {
-        self.state = RaftState::CANDIDATE;
-        self.voted_for = Some(self.id);
-        self.term += 1;
+    fn become_candidate(&mut self, core: &mut RaftState) {
+        core.role = Role::Candidate;
+        core.voted_for = Some(self.id);
+        core.term += 1;
         self.received_votes = 1;
     }
 
-    fn become_leader(&mut self) {
-        tracing::info!(node = self.id, term = self.term, "Became leader");
-        self.state = RaftState::LEADER;
+    fn become_leader(&mut self, core: &mut RaftState) {
+        tracing::info!(node = self.id, term = core.term, "Became leader");
+        core.role = Role::Leader;
     }
 }
