@@ -23,8 +23,12 @@ fn ping_test() -> turmoil::Result {
 
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(200))
-        .fail_rate(0.05)
         .enable_random_order()
+        // No failure rate for grpc yet
+        // https://github.com/tokio-rs/turmoil/issues/185
+        //.fail_rate(0.1) 
+        .min_message_latency(Duration::from_millis(1))
+        .max_message_latency(Duration::from_millis(1000))
         .build_with_rng(Box::new(SmallRng::seed_from_u64(42)));
 
     let servers: Vec<_> = (1..=3).map(|i| format!("server-{}", i)).collect();
