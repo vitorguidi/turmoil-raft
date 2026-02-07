@@ -1,9 +1,16 @@
 use std::collections::BTreeMap;
-use crate::pb::raft::{AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse, LogEntry, RequestVoteRequest, RequestVoteResponse};
+use crate::pb::raft::{AppendEntriesRequest, AppendEntriesResponse,
+     InstallSnapshotRequest, InstallSnapshotResponse, LogEntry,
+      RequestVoteRequest, RequestVoteResponse};
+use rand::Rng;
 use tokio::sync::{mpsc, oneshot};
 use crate::raft::client::RaftClient;
+use tokio::time::{Duration, sleep, Instant, Sleep};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use rand::rngs::SmallRng;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum RaftState {
     FOLLOWER,
     CANDIDATE,
@@ -32,6 +39,11 @@ pub struct Raft {
     state: RaftState,
     rx: mpsc::Receiver<RaftMsg>,
     peers: BTreeMap<u64, RaftClient>,
+    rng: Arc<Mutex<SmallRng>>,
+    election_timeout: Pin<Box<Sleep>>,
+    heartbeat_interval: u64,
+    election_interval: u64,
+    election_jitter: u64,
     // Persistent state on all servers
     pub term: u64,
     voted_for: Option<u64>,
@@ -46,13 +58,26 @@ pub struct Raft {
 }
 
 impl Raft {
-    pub fn new(id: u64, rx: mpsc::Receiver<RaftMsg>, peers: BTreeMap<u64, RaftClient>) -> Self {
+    pub fn new(
+        id: u64,
+        rx: mpsc::Receiver<RaftMsg>,
+        peers: BTreeMap<u64, RaftClient>,
+        rng: Arc<Mutex<SmallRng>>,
+        heartbeat_interval: u64,
+        election_interval: u64,
+        election_jitter: u64,
+    )-> Self {
         let nr_peers = peers.len();
         Self {
             id,
             state: RaftState::FOLLOWER,
             rx,
             peers,
+            rng,
+            election_timeout: Box::pin(sleep(Duration::from_millis(election_interval))),
+            election_interval,
+            election_jitter,
+            heartbeat_interval,
             term: 0,
             voted_for: None,
             log: Vec::new(),
@@ -64,8 +89,7 @@ impl Raft {
     }
 
     pub async fn run(mut self) {
-        let mut election_timer = tokio::time::interval(std::time::Duration::from_millis(300));
-        let mut heartbeat_timer = tokio::time::interval(std::time::Duration::from_millis(150));
+        let mut heartbeat_timer = tokio::time::interval(Duration::from_millis(self.heartbeat_interval));
         loop {
             tokio::select! { biased;
                 Some(msg) = self.rx.recv() => {
@@ -84,11 +108,12 @@ impl Raft {
                         }
                     }
                 },
-                _ = election_timer.tick() => {
-                    self.handle_heartbeat_timeout().await;
+                _ = &mut self.election_timeout => {
+                    self.handle_election_timeout().await;
+                    self.reset_election_timeout();
                 },
                 _ = heartbeat_timer.tick() => {
-                    self.handle_election_timeout().await;
+                    self.handle_heartbeat_timeout().await;
                 }
             }
         }
@@ -115,10 +140,9 @@ impl Raft {
 
     pub async fn handle_heartbeat_timeout(&mut self) {
         tracing::info!(node = self.id, "Heartbeat timeout");
-    }
-
-    pub async fn handle_election_timeout(&mut self) {
-        tracing::info!(node = self.id, "Heartbeat timer tick");
+        if self.state != RaftState::LEADER {
+            return;
+        }
         for (&peer_id, peer) in &self.peers {
             let req = AppendEntriesRequest {
                 ..Default::default()
@@ -130,6 +154,15 @@ impl Raft {
                 tracing::info!(node = id, peer = peer_id, "Got append entries response: {:?}", resp);
             });
         }
+    }
+
+    pub async fn handle_election_timeout(&mut self) {
+        tracing::info!(node = self.id, "Heartbeat timer tick");
+    }
+
+    pub fn reset_election_timeout(&mut self) {
+        let timeout = self.election_interval + self.rng.lock().unwrap().gen_range(0..self.election_jitter);
+        self.election_timeout.as_mut().reset(Instant::now() + Duration::from_millis(timeout));
     }
 
 }
