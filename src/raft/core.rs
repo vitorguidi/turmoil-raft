@@ -230,6 +230,10 @@ impl Raft {
                 self.reset_election_timeout();
                 return;
             }
+            if resp.term < core.term {
+                // Stale response from a previous election round; ignore.
+                return;
+            }
             if resp.vote_granted {
                 self.received_votes += 1;
                 tracing::info!(node = self.id, peer = peer_id, votes = self.received_votes, quorum = self.quorum(), "Vote granted");
