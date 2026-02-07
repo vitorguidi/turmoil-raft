@@ -19,9 +19,11 @@ fn ping_test() -> turmoil::Result {
 
     let rng = Arc::new(Mutex::new(SmallRng::seed_from_u64(42)));
 
+    let rpc_timeout = Duration::from_millis(500);
+
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(200))
-        .fail_rate(0.0)
+        .fail_rate(0.05)
         .enable_random_order()
         .build_with_rng(Box::new(SmallRng::seed_from_u64(42)));
 
@@ -67,7 +69,7 @@ fn ping_test() -> turmoil::Result {
                     }
                     let channel = create_channel(&format!("{}:9000", peer_name));
                     let tonic_client = TonicRaftClient::new(channel);
-                    peers.insert(peer_id, RaftClient::new(tonic_client));
+                    peers.insert(peer_id, RaftClient::new(tonic_client, rpc_timeout));
                 }
 
                 // Run the Raft core directly so the host stays alive
