@@ -58,6 +58,10 @@ pub enum RaftMsg {
         peer_id: u64,
         resp: RequestVoteResponse,
     },
+    AppendEntriesResp {
+        peer_id: u64,
+        resp: AppendEntriesResponse,
+    },
     ElectionTimeout,
     HeartbeatTimeout,
 }
@@ -136,6 +140,9 @@ impl Raft {
                 },
                 RaftMsg::RequestVoteResp { peer_id, resp } => {
                     self.handle_request_vote_resp(peer_id, resp);
+                },
+                RaftMsg::AppendEntriesResp { peer_id, resp } => {
+                    self.handle_append_entries_resp(peer_id, resp);
                 },
                 RaftMsg::ElectionTimeout => {
                     self.handle_election_timeout();
@@ -248,6 +255,22 @@ impl Raft {
         }
     }
 
+    fn handle_append_entries_resp(&mut self, peer_id: u64, resp: AppendEntriesResponse) {
+        let core_arc = self.core.clone();
+        let mut core = core_arc.lock().unwrap();
+        if resp.term > core.term {
+            self.become_follower(&mut core, resp.term);
+            self.reset_election_timeout();
+            return;
+        }
+        if core.role != Role::Leader {
+            return;
+        }
+        tracing::info!(node = self.id, peer = peer_id, success = resp.success, "AppendEntries response");
+        // TODO: on success, advance next_index/match_index and try to advance commit_index
+        // TODO: on failure, decrement next_index and retry
+    }
+
     fn handle_election_timeout(&mut self) {
         let core_arc = self.core.clone();
         let mut core = core_arc.lock().unwrap();
@@ -308,14 +331,14 @@ impl Raft {
                 ..Default::default()
             };
             let peer = peer.clone();
-            let id = self.id;
+            let tx = self.tx.clone();
             tokio::spawn(async move {
                 match peer.append_entries(req).await {
                     Ok(resp) => {
-                        tracing::info!(node = id, peer = peer_id, "Heartbeat resp: success={}", resp.success);
+                        let _ = tx.send(RaftMsg::AppendEntriesResp { peer_id, resp }).await;
                     },
                     Err(e) => {
-                        tracing::warn!(node = id, peer = peer_id, "Heartbeat failed: {}", e);
+                        tracing::warn!(peer = peer_id, "AppendEntries RPC failed: {}", e);
                     }
                 }
             });
