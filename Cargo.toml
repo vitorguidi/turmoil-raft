@@ -10,7 +10,7 @@ prost = "0.13"
 tower = { version = "0.5", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand = "0.8"
 async-trait = "0.1"
 bytes = "1"
@@ -21,3 +21,6 @@ tonic-build = "0.12"
 
 [dev-dependencies]
 turmoil = "0.6"
+tokio-stream = "0.1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+hyper = "1.0"
