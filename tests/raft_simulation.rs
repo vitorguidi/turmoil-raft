@@ -41,10 +41,11 @@ fn ping_test() -> turmoil::Result {
                 // Bind first to ensure we are listening before peers try to connect
                 let listener = turmoil::net::TcpListener::bind("0.0.0.0:9000").await?;
                 
+                let tx_rpc = tx.clone();
                 // Start the gRPC server.
                 tokio::spawn(async move {
                     Server::builder()
-                        .add_service(RaftServer::new(RaftService::new(tx)))
+                        .add_service(RaftServer::new(RaftService::new(tx_rpc)))
                         .serve_with_incoming(listener_stream(listener))
                         .await
                         .unwrap();
@@ -64,7 +65,7 @@ fn ping_test() -> turmoil::Result {
 
                 // Run the Raft core directly so the host stays alive
                 // (turmoil stops polling spawned tasks once the host closure returns).
-                Raft::new(self_id, rx, peers, rng, 150, 300, 150).run().await;
+                Raft::new(self_id, tx, rx, peers, rng, 150, 300, 150).run().await;
 
                 Ok(())
             }

@@ -37,15 +37,15 @@ impl Raft for RaftService {
         &self,
         request: Request<AppendEntriesRequest>
     )-> Result<Response<AppendEntriesResponse>, Status> {
-        self.dispatch(request, |req, reply| RaftMsg::AppendEntries { req, reply }).await
+        self.dispatch(request, |req, reply| RaftMsg::AppendEntriesReq { req, reply }).await
     }
 
     async fn request_vote(&self, request: Request<RequestVoteRequest>) -> Result<Response<RequestVoteResponse>, Status> {
-        self.dispatch(request, |req: RequestVoteRequest, reply| RaftMsg::RequestVote { req, reply }).await
+        self.dispatch(request, |req: RequestVoteRequest, reply| RaftMsg::RequestVoteReq { req, reply }).await
     }
 
     async fn install_snapshot(&self, request: Request<InstallSnapshotRequest>) -> Result<Response<InstallSnapshotResponse>, Status> {
-        self.dispatch(request, |req: InstallSnapshotRequest, reply| RaftMsg::InstallSnapshot { req, reply }).await
+        self.dispatch(request, |req: InstallSnapshotRequest, reply| RaftMsg::InstallSnapshotReq { req, reply }).await
     }
 
 }
