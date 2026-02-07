@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package kv;
+
+service Kv {
+  rpc Get (GetRequest) returns (GetResponse);
+  rpc PutAppend (PutAppendRequest) returns (PutAppendResponse);
+}
+
+message GetRequest {
+  string key = 1;
+  string client_id = 2;
+  uint64 seq_num = 3;
+}
+
+message GetResponse {
+  bool wrong_leader = 1;
+  string err = 2;
+  string value = 3;
+}
+
+message PutAppendRequest {
+  string key = 1;
+  string value = 2;
+  string op = 3; // "Put" or "Append"
+  string client_id = 4;
+  uint64 seq_num = 5;
+}
+
+message PutAppendResponse {
+  bool wrong_leader = 1;
+  string err = 2;
+}

@@ -1,6 +1,23 @@
 [package]
 name = "turmoil-raft"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+tokio = { version = "1", features = ["full"] }
+tonic = "0.12"
+prost = "0.13"
+tower = { version = "0.5", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+rand = "0.8"
+async-trait = "0.1"
+bytes = "1"
+fnv = "1.0" # Fast hashing for sharding
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[dev-dependencies]
+turmoil = "0.6"
