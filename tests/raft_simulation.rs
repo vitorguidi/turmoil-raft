@@ -234,6 +234,9 @@ fn run_simulation(config: SimConfig) -> turmoil::Result {
 
 #[test]
 fn raft_fuzz() {
+    // Initialize tracing so we can see logs. try_init() prevents double-init errors.
+    let _ = tracing_subscriber::fmt().without_time().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).try_init();
+
     // Only run if explicitly requested via env var to avoid blocking CI
     if std::env::var("RAFT_FUZZ").is_err() {
         return;
