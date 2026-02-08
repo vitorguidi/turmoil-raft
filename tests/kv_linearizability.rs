@@ -1,6 +1,6 @@
 use turmoil_raft::raft::{
     client::RaftClient,
-    core::{Raft, RaftState},
+    core::{Raft, RaftState, Role},
     persist::Persister,
     rpc::RaftService,
 };
@@ -20,6 +20,7 @@ mod common;
 use common::*;
 
 const NR_NODES: u32 = 5;
+const NR_CLIENTS: u32 = 3;
 const HEARTBEAT_INTERVAL: u64 = 150;
 const ELECTION_INTERVAL: u64 = 300;
 const ELECTION_JITTER: u64 = 150;
@@ -28,6 +29,9 @@ const MAX_STEPS: u32 = 200_000;
 const SEED: u64 = 777;
 const OP_DELAY_MIN_MS: u64 = 50;
 const OP_DELAY_MAX_MS: u64 = 500;
+const CRASH_PROBABILITY: f64 = 0.0003;
+const BOUNCE_DELAY_MIN: u64 = 2000;
+const BOUNCE_DELAY_MAX: u64 = 6000;
 
 fn build_kv_sim(seed: u64) -> (turmoil::Sim<'static>, Vec<Arc<Mutex<RaftState>>>) {
     let rng = Arc::new(Mutex::new(SmallRng::seed_from_u64(seed)));
@@ -120,9 +124,16 @@ fn kv_linearizability_detsim() -> turmoil::Result {
 
     let step_clock: StepClock = Arc::new(AtomicU64::new(0));
     let history: History = Arc::new(Mutex::new(Vec::new()));
+    let oracle = Oracle::new(state_handles.clone());
+    let mut down_nodes: BTreeMap<usize, u64> = BTreeMap::new();
+    let mut rng = SmallRng::seed_from_u64(SEED);
+    let mut crash_count = 0;
+    let mut bounce_count = 0;
 
-    // Spawn 3 concurrent clients on separate hosts
-    for c in 0..3u32 {
+    let wall_start = std::time::Instant::now();
+
+    // Spawn concurrent clients on separate hosts
+    for c in 0..NR_CLIENTS {
         let step_clock = step_clock.clone();
         let history = history.clone();
 
@@ -165,12 +176,74 @@ fn kv_linearizability_detsim() -> turmoil::Result {
         step_clock.store(step as u64, std::sync::atomic::Ordering::Relaxed);
         sim.step()?;
 
+        oracle.assert_invariants();
+
         let h = history.lock().unwrap();
         if h.len() > last_history_len {
             check_linearizability(&h, &state_handles);
             last_history_len = h.len();
         }
+
+        // Bounces
+        let bounced: Vec<usize> = down_nodes.iter()
+            .filter(|&(_, &bounce_at)| step as u64 >= bounce_at)
+            .map(|(&idx, _)| idx)
+            .collect();
+
+        for idx in bounced {
+            let name = format!("server-{}", idx + 1);
+            tracing::info!(step, target = ?name, "BOUNCING");
+            sim.bounce(name.as_str());
+            down_nodes.remove(&idx);
+            bounce_count += 1;
+            tracing::info!(step, target = ?name, bounce_count, "BOUNCED");
+        }
+
+        // Crashes
+        for i in 0..NR_NODES as usize {
+            if down_nodes.len() + 1 >= NR_NODES as usize{
+                continue;
+            }
+            if !down_nodes.contains_key(&i) && rng.gen_bool(CRASH_PROBABILITY) {
+                let name = format!("server-{}", i + 1);
+                tracing::info!(step, target = ?name, "CRASHING");
+                sim.crash(name.as_str());
+                {
+                    let mut s = state_handles[i].lock().unwrap();
+                    s.commit_index = 0;
+                    s.last_applied = 0;
+                    s.role = Role::Follower;
+                }
+                let delay = rng.gen_range(BOUNCE_DELAY_MIN..BOUNCE_DELAY_MAX);
+                down_nodes.insert(i, step as u64 + delay);
+                crash_count += 1;
+                tracing::info!(step, target = ?name, crash_count,"Crashed");
+            }
+        }
+
+        // Sim updates
+        if step % 1000 == 0 {
+             let commits: Vec<u64> = state_handles.iter()
+                .map(|s| s.lock().unwrap().commit_index)
+                .collect();
+             let terms: Vec<u64> = state_handles.iter()
+                .map(|s| s.lock().unwrap().term)
+                .collect();
+             tracing::info!(step, ?commits, ?terms, elapsed = ?std::time::Instant::now().duration_since(wall_start), "Sim step");
+        }
+
     }
+    
+
+    let wall_elapsed = wall_start.elapsed();
+    let virtual_elapsed = sim.elapsed(); // This is the total virtual time passed
+    tracing::info!("--- Simulation Results ---");
+    tracing::info!("Physical (Wall) Time: {:?}", wall_elapsed);
+    tracing::info!("Virtual (Simulated) Time: {:?}", virtual_elapsed);
+    
+    // High-level systems tip: Calculate the "Speedup Factor"
+    let speedup = virtual_elapsed.as_secs_f64() / wall_elapsed.as_secs_f64();
+    tracing::info!("Simulation Speedup: {:.2}x", speedup);
 
     Ok(())
 }
