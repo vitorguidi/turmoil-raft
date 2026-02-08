@@ -624,15 +624,11 @@ impl Raft {
     }
 
     fn become_candidate(&mut self, core: &mut RaftState) {
-        // BUG: canary to verify fuzz pipeline catches invariant violations
-        // Skip term increment so all nodes claim the same term → oracle detects multi-leader
-        core.role = Role::Leader;
+        core.role = Role::Candidate;
+        core.voted_for = Some(self.id);
+        core.term += 1;
+        self.received_votes = 1;
         self.persist(core);
-        // core.role = Role::Candidate;
-        // core.voted_for = Some(self.id);
-        // core.term += 1;
-        // self.received_votes = 1;
-        // self.persist(core);
     }
 
     fn become_leader(&mut self, core: &mut RaftState) {
