@@ -30,7 +30,6 @@ fn raft_deterministic_simulation() -> turmoil::Result {
     let rpc_timeout = Duration::from_millis(500);
 
     let mut sim = turmoil::Builder::new()
-        .simulation_duration(Duration::from_secs(3600)) // 1 hour virtual time
         .enable_random_order()
         .fail_rate(NETWORK_FAIL_RATE)
         .build_with_rng(Box::new(SmallRng::seed_from_u64(RNG_SEED)));
@@ -170,6 +169,16 @@ fn raft_deterministic_simulation() -> turmoil::Result {
              tracing::info!(step, ?commits, ?terms, elapsed = ?std::time::Instant::now().duration_since(wall_start), "Sim step");
         }
     }
+
+    let wall_elapsed = wall_start.elapsed();
+    let virtual_elapsed = sim.elapsed(); // This is the total virtual time passed
+    tracing::info!("--- Simulation Results ---");
+    tracing::info!("Physical (Wall) Time: {:?}", wall_elapsed);
+    tracing::info!("Virtual (Simulated) Time: {:?}", virtual_elapsed);
+    
+    // High-level systems tip: Calculate the "Speedup Factor"
+    let speedup = virtual_elapsed.as_secs_f64() / wall_elapsed.as_secs_f64();
+    tracing::info!("Simulation Speedup: {:.2}x", speedup);
 
     Ok(())
 }
