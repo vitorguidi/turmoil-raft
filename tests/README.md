@@ -19,7 +19,7 @@ To run the fuzzer locally (simulating the Kubernetes deployment):
 export $SA_PATH="gcs SA json key location"
 export FUZZ_IMAGE="image built in previous step"
 docker run --rm -it \
-  -e RUST_LOG=INFO \
+  -e RUST_LOG=WARN \
   -e TEST_TYPE=kv \
   -e FUZZ_MODE=fuzz \
   -e MAX_STEPS=100000 \

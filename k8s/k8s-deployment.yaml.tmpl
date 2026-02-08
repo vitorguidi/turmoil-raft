@@ -16,6 +16,8 @@ spec:
       - name: fuzzer
         image: ${FUZZER_IMAGE}
         env:
+        - name: RUST_LOG
+          value: "WARN"
         - name: TEST_TYPE
           value: "${TEST_TYPE}"
         - name: MAX_STEPS

@@ -24,6 +24,7 @@ fn simulation_harness() {
         println!("Reproducing crash from {}", file_path);
         let data = std::fs::read(file_path).expect("Failed to read fuzz file");
         let config: SimConfig = serde_json::from_slice(&data).expect("Failed to deserialize config");
+        println!("Loaded config with seed: {}", config.seed);
         
         let result = match test_type.as_str() {
             "kv" => run_kv_simulation(config),

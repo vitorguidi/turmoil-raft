@@ -508,10 +508,6 @@ impl Raft {
         let core_arc = self.core.clone();
         let mut core = core_arc.lock().unwrap();
 
-        // BUG: Force leader to test crash reporting
-        self.become_leader(&mut core);
-        return;
-
         if core.role == Role::Leader {
             return;
         }
