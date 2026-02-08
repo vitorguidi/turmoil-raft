@@ -95,36 +95,39 @@ impl Oracle {
             .map(|h| h.lock().unwrap())
             .collect();
 
-        // Find current leader(s)
-        let leaders: Vec<usize> = states.iter().enumerate()
+        // Identify all leaders (active or zombie)
+        let leaders: Vec<(usize, u64)> = states.iter().enumerate()
             .filter(|(_, s)| s.role == Role::Leader)
-            .map(|(i, _)| i)
+            .map(|(i, s)| (i, s.term))
             .collect();
 
-        if leaders.len() != 1 {
-            // No single leader or multiple leaders (checked by election safety), skip
-            return;
-        }
+        for (leader_idx, leader_term) in leaders {
+            let leader_state = &states[leader_idx];
+            let leader_log = &leader_state.log;
 
-        let leader = &states[leaders[0]];
-        let leader_log_len = leader.log.len();
+            for (i, state) in states.iter().enumerate() {
+                for idx in 1..=state.commit_index {
+                    let ui = idx as usize;
+                    if ui >= state.log.len() {
+                        break;
+                    }
+                    let entry = &state.log[ui];
 
-        for (i, state) in states.iter().enumerate() {
-            for idx in 1..=state.commit_index {
-                let ui = idx as usize;
-                if ui >= state.log.len() {
-                    break;
+                    // Leader Completeness: if committed in term T, present in leaders of term >= T.
+                    if leader_term >= entry.term {
+                        assert!(
+                            ui < leader_log.len(),
+                            "Leader completeness violation: server {} committed index {} (term {}) but leader {} (term {}) log is too short (len {})",
+                            i + 1, idx, entry.term, leader_idx + 1, leader_term, leader_log.len()
+                        );
+                        let leader_entry = &leader_log[ui];
+                        assert_eq!(
+                            leader_entry.term, entry.term,
+                            "Leader completeness violation: server {} committed index {} (term {}) but leader {} (term {}) has term {}",
+                            i + 1, idx, entry.term, leader_idx + 1, leader_term, leader_entry.term
+                        );
+                    }
                 }
-                assert!(
-                    ui < leader_log_len,
-                    "Leader completeness violation: server {} committed index {} but leader log is too short (len {})",
-                    i + 1, idx, leader_log_len
-                );
-                assert_eq!(
-                    leader.log[ui].term, state.log[ui].term,
-                    "Leader completeness violation at index {}: leader has term {}, server {} has term {}",
-                    idx, leader.log[ui].term, i + 1, state.log[ui].term
-                );
             }
         }
     }

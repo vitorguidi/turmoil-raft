@@ -15,13 +15,13 @@ use common::*;
 fn raft_deterministic_simulation() -> turmoil::Result {
     let _ = tracing_subscriber::fmt().without_time().try_init();
     
-    const MAX_STEPS: u32 = 200000;
+    const MAX_STEPS: u32 = 1000000;
     const LATENCY_AVG: f64 = 50.0;
     const NETWORK_FAIL_RATE: f64 = 0.01;
     const ELECTION_JITTER: u32 = 150;
     const ELECTION_INTERVAL: u32 = 300;
     const HEARTBEAT_INTERVAL: u32 = 150;
-    const NR_NODES: u32 = 3;
+    const NR_NODES: u32 = 7;
     const RNG_SEED: u64 = 999;
     const CRASH_PROBABILITY: f64 = 1.0 / 20000.0;
     const BOUNCE_DELAY: u32 = 5000;
