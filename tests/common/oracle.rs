@@ -33,7 +33,9 @@ impl Oracle {
         }
     }
 
-    /// If two servers have a log entry at the same index, it must have the same term.
+    /// Log Matching Property: if two entries have the same index AND same term,
+    /// they must store the same command. Different terms at the same index are
+    /// normal during log divergence (e.g., after a partition/leader change).
     pub fn assert_log_matching(&self) {
         let states: Vec<_> = self.handles.iter()
             .map(|h| h.lock().unwrap())
@@ -45,10 +47,10 @@ impl Oracle {
                 for idx in 0..min_len {
                     let ei = &states[i].log[idx];
                     let ej = &states[j].log[idx];
-                    if ei.index == ej.index && ei.term != ej.term {
+                    if ei.index == ej.index && ei.term == ej.term && ei.command != ej.command {
                         panic!(
-                            "Log matching violation at index {}: server {} has term {}, server {} has term {}",
-                            ei.index, i + 1, ei.term, j + 1, ej.term
+                            "Log matching violation at index {} term {}: server {} and server {} have different commands",
+                            ei.index, ei.term, i + 1, j + 1
                         );
                     }
                 }

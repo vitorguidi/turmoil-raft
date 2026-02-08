@@ -17,6 +17,12 @@ fn ping_test() -> turmoil::Result {
     let _ = tracing_subscriber::fmt().without_time().try_init();
     // oracle checking is O(nr_nodes*|log_size|^2, so lets be considerate
     const MAX_STEPS: u32 = 200000;
+    const LATENCY_AVG: f64 = 50.0;
+    const ELECTION_JITTER: u32 = 150;
+    const ELECTION_INTERVAL: u32 = 300;
+    const HEARTBEAT_INTERVAL: u32 = 150;
+    const NR_NODES: u32 = 7;
+
 
     let rng = Arc::new(Mutex::new(SmallRng::seed_from_u64(42)));
 
@@ -28,11 +34,12 @@ fn ping_test() -> turmoil::Result {
         // No failure rate for grpc yet
         // https://github.com/tokio-rs/turmoil/issues/185
         //.fail_rate(0.1)
-        .min_message_latency(Duration::from_millis(1))
-        .max_message_latency(Duration::from_millis(100))
         .build_with_rng(Box::new(SmallRng::seed_from_u64(42)));
 
-    let servers: Vec<_> = (1..=3).map(|i| format!("server-{}", i)).collect();
+    // Exponential distribution with mean = 50ms (lambda = 1/50 = 0.02)
+    sim.set_message_latency_curve((1.0 / LATENCY_AVG).into());
+
+    let servers: Vec<_> = (1..=NR_NODES).map(|i| format!("server-{}", i)).collect();
     let mut state_handles = Vec::new();
     let mut tx_handles: Vec<Arc<mpsc::Sender<RaftMsg>>> = Vec::new();
 
@@ -90,7 +97,7 @@ fn ping_test() -> turmoil::Result {
 
                 // Run the Raft core directly so the host stays alive
                 // (turmoil stops polling spawned tasks once the host closure returns).
-                Raft::new(self_id, tx, rx, peers, rng, 150, 300, 150, state).run().await;
+                Raft::new(self_id, tx, rx, peers, rng, HEARTBEAT_INTERVAL.into(), ELECTION_INTERVAL.into(), ELECTION_JITTER.into(), state).run().await;
 
                 Ok(())
             }
@@ -133,7 +140,33 @@ fn ping_test() -> turmoil::Result {
     let oracle = Oracle::new(state_handles.clone());
     let wall_start = std::time::Instant::now();
 
+    // Track active network partitions as (i, j) pairs where i < j
+    let mut partitions: std::collections::BTreeSet<(usize, usize)> = std::collections::BTreeSet::new();
+
     for step in 0..MAX_STEPS {
+        // Network chaos: ~1 in 2000 steps, flip a coin
+        if rng.lock().unwrap().gen_ratio(1, 2000) {
+            let disconnect = rng.lock().unwrap().gen_bool(0.5);
+            if disconnect && step < 150000 {
+                // Pick a random pair to disconnect
+                let a = rng.lock().unwrap().gen_range(0..servers.len());
+                let b = (a + rng.lock().unwrap().gen_range(1..servers.len())) % servers.len();
+                let pair = (a.min(b), a.max(b));
+                if !partitions.contains(&pair) {
+                    tracing::info!(step, a = pair.0 + 1, b = pair.1 + 1, "CHAOS: partitioning");
+                    sim.partition(servers[pair.0].as_str(), servers[pair.1].as_str());
+                    partitions.insert(pair);
+                }
+            } else if !partitions.is_empty() {
+                // Pick a random active partition to repair
+                let idx = rng.lock().unwrap().gen_range(0..partitions.len());
+                let pair = *partitions.iter().nth(idx).unwrap();
+                tracing::info!(step, a = pair.0 + 1, b = pair.1 + 1, "CHAOS: repairing");
+                sim.repair(servers[pair.0].as_str(), servers[pair.1].as_str());
+                partitions.remove(&pair);
+            }
+        }
+
         sim.step()?;
         oracle.assert_invariants();
         if step % 1000 == 0 {
@@ -143,8 +176,12 @@ fn ping_test() -> turmoil::Result {
             let log_lens: Vec<usize> = state_handles.iter()
                 .map(|s| s.lock().unwrap().log.len())
                 .collect();
+            let roles: Vec<String> = state_handles.iter()
+                .map(|s| format!("{:?}", s.lock().unwrap().role))
+                .collect();
             tracing::info!(
-                step, ?commits, ?log_lens,
+                step, ?commits, ?log_lens, ?roles,
+                partitions = partitions.len(),
                 elapsed = ?std::time::Instant::now().duration_since(wall_start),
                 "Simulation progress"
             );

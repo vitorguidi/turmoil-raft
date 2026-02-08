@@ -88,7 +88,11 @@ pub mod connector {
 
 pub fn create_channel(addr: &str) -> Channel {
     let uri = format!("http://{}", addr).parse::<Uri>().unwrap();
-    Endpoint::from(uri).connect_with_connector_lazy(connector::connector())
+    Endpoint::from(uri)
+        // Detect dead connections (e.g. after turmoil partition heals)
+        .http2_keep_alive_interval(std::time::Duration::from_millis(500))
+        .keep_alive_timeout(std::time::Duration::from_millis(1000))
+        .connect_with_connector_lazy(connector::connector())
 }
 
 pub fn listener_stream(
