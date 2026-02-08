@@ -5,7 +5,7 @@ metadata:
   labels:
     app: raft-fuzzer
 spec:
-  replicas: 1
+  replicas: 10
   selector:
     matchLabels:
       app: raft-fuzzer
@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
       - name: fuzzer
-        image: turmoil-raft-fuzzer:latest
+        image: "${FUZZER_IMAGE}"
         # IfNotPresent allows using the locally built image loaded into kind
         imagePullPolicy: IfNotPresent
         command: [
@@ -31,7 +31,7 @@ spec:
         - name: FUZZ_MODE
           value: "fuzz"
         - name: BUCKET_NAME
-          value: "your-raft-crash-bucket" # REPLACE THIS
+          value: "${BUCKET_NAME}"
         - name: GOOGLE_APPLICATION_CREDENTIALS
           value: "/etc/gcp/key.json"
         volumeMounts:
@@ -51,5 +51,5 @@ type: Opaque
 data:
   # Run this command to generate the value:
   # cat /path/to/your/gcp-sa-key.json | base64 | tr -d '\n'
-  key.json: PASTE_YOUR_BASE64_ENCODED_KEY_HERE
+  key.json: ${GCP_KEY_BASE64}
 ---

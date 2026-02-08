@@ -47,3 +47,24 @@ RUST_LOG=info RAFT_FUZZ=1 FUZZ_MODE=reproduce FUZZ_FILE=repro.json \
 ```
 
 This will run the simulation with the exact seed and parameters from the crash file, allowing you to debug the failure.
+
+## 4. Deploy to Kubernetes
+
+To run the fuzzer at scale on a Kubernetes cluster, use the template in `k8s/`.
+
+1.  **Build and Push Image:**
+    ```bash
+    docker build -t gcr.io/your-project/turmoil-raft-fuzzer:latest .
+    docker push gcr.io/your-project/turmoil-raft-fuzzer:latest
+    ```
+
+2.  **Deploy:**
+    Set the required environment variables and apply the template using `envsubst`.
+
+    ```bash
+    export FUZZER_IMAGE=gcr.io/your-project/turmoil-raft-fuzzer:latest
+    export BUCKET_NAME=your-crash-bucket
+    export GCP_KEY_BASE64=$(cat /path/to/sa.json | base64 | tr -d '\n')
+
+    envsubst < k8s/k8s-deployment.yaml.tmpl | kubectl apply -f -
+    ```
