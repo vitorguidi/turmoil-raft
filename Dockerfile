@@ -1,7 +1,7 @@
 FROM rust:1.84 AS builder
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y protobuf-compiler
+RUN apt-get update && apt-get install -y protobuf-compiler pkg-config libssl-dev
 
 COPY . .
 
@@ -15,4 +15,4 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/local/bin/fuzzer /usr/local/bin/fuzzer
 
-CMD ["/usr/local/bin/fuzzer"]
+CMD ["/usr/local/bin/fuzzer", "--nocapture"]

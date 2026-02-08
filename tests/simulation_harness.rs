@@ -8,7 +8,8 @@ fn simulation_harness() {
     // Initialize tracing
     let _ = tracing_subscriber::fmt()
         .without_time()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")))
         .try_init();
 
     let bucket = std::env::var("BUCKET_NAME").unwrap_or_else(|_| "raft-crashes".to_string());
@@ -49,8 +50,16 @@ fn simulation_harness() {
                 }
             });
 
-            if result.is_err() {
-                println!("Test crashed! Saving report...");
+            if let Err(e) = result {
+                let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                    format!("{}", s)
+                } else if let Some(s) = e.downcast_ref::<String>() {
+                    format!("{}", s)
+                } else {
+                    "Unknown panic".to_string()
+                };
+                println!("Test crashed! Panic: {}", msg);
+                println!("Saving report...");
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
@@ -64,7 +73,7 @@ fn simulation_harness() {
                 // Upload to GCS with folder structure: bucket/test_type/filename
                 let object_name = format!("{}/{}", test_type, filename);
                 println!("Uploading to gs://{}/{}", bucket, object_name);
-                // common::upload_to_gcs(&bucket, &object_name, &filename);
+                common::upload_to_gcs(&bucket, &object_name, &filename);
             }
         }
     }
