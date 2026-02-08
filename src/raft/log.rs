@@ -30,6 +30,16 @@ pub fn first_index_for_term(log: &[LogEntry], term: u64) -> u64 {
     0
 }
 
+/// Find the last index in the log with the given term.
+pub fn last_index_for_term(log: &[LogEntry], term: u64) -> Option<u64> {
+    for entry in log.iter().rev() {
+        if entry.term == term {
+            return Some(entry.index);
+        }
+    }
+    None
+}
+
 pub fn sentinel() -> LogEntry {
     LogEntry {
         index: 0,

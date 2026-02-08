@@ -4,6 +4,7 @@ use crate::pb::raft::{AppendEntriesRequest, AppendEntriesResponse,
       RequestVoteRequest, RequestVoteResponse};
 use crate::raft::log;
 use crate::raft::log::sentinel;
+use crate::raft::persist::{Persister, encode, decode};
 use rand::Rng;
 use tokio::sync::{mpsc, oneshot};
 use crate::raft::client::RaftClient;
@@ -87,6 +88,8 @@ pub struct Raft {
     election_jitter: u64,
     // Shared state for oracle inspection
     pub core: Arc<Mutex<RaftState>>,
+    // Persistent state
+    persister: Arc<Mutex<Persister>>,
     // Volatile leader state (reinitialized on election)
     next_index: BTreeMap<u64, u64>,
     match_index: BTreeMap<u64, u64>,
@@ -103,7 +106,20 @@ impl Raft {
         election_interval: u64,
         election_jitter: u64,
         core: Arc<Mutex<RaftState>>,
+        persister: Arc<Mutex<Persister>>,
     ) -> Self {
+        {
+            let p = persister.lock().unwrap();
+            let state_bytes = p.read_raft_state();
+            if !state_bytes.is_empty() {
+                let (term, voted_for, log) = decode(state_bytes);
+                let mut c = core.lock().unwrap();
+                c.term = term;
+                c.voted_for = voted_for;
+                c.log = log;
+            }
+        }
+
         Self {
             id,
             received_votes: 0,
@@ -116,9 +132,15 @@ impl Raft {
             election_jitter,
             heartbeat_interval,
             core,
+            persister,
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
         }
+    }
+
+    fn persist(&self, core: &mut RaftState) {
+        let data = encode(core.term, core.voted_for, &core.log);
+        self.persister.lock().unwrap().save_raft_state(data);
     }
 
     // -- run loop --
@@ -222,6 +244,7 @@ impl Raft {
         }
 
         // Append entries, truncating conflicts
+        let mut log_changed = false;
         for entry in &req.entries {
             let idx = entry.index as usize;
             if idx < core.log.len() {
@@ -229,11 +252,17 @@ impl Raft {
                     // Conflict: truncate from here
                     core.log.truncate(idx);
                     core.log.push(entry.clone());
+                    log_changed = true;
                 }
                 // else: already have this entry, skip
             } else {
                 core.log.push(entry.clone());
+                log_changed = true;
             }
+        }
+
+        if log_changed {
+            self.persist(&mut core);
         }
 
         // Advance commit_index
@@ -285,6 +314,7 @@ impl Raft {
 
         if can_vote && log_ok {
             core.voted_for = Some(req.candidate_id);
+            self.persist(&mut core);
             self.reset_election_timeout();
             tracing::info!(node = self.id, candidate = req.candidate_id, term = req.term, "Granting vote");
             RequestVoteResponse {
@@ -380,12 +410,27 @@ impl Raft {
                 );
             }
         } else {
-            // Simple backtracking: decrement next_index (fast backup in Phase 3)
-            let ni = self.next_index.get(&peer_id).copied().unwrap_or(1);
-            if ni > 1 {
-                self.next_index.insert(peer_id, ni - 1);
+            // Fast backup
+            let mut new_next_index = resp.conflict_index;
+            if resp.conflict_term != 0 {
+                if let Some(last_idx) = log::last_index_for_term(&core.log, resp.conflict_term) {
+                    new_next_index = last_idx + 1;
+                }
             }
-            tracing::info!(node = self.id, peer = peer_id, next_index = ni - 1, "AppendEntries rejected, backing up");
+            // Sanity check: ensure valid index (>= 1 for real entries, though 1 is start)
+            // If conflict_index is 0 (shouldn't happen for active log), clamp to 1.
+            if new_next_index < 1 {
+                new_next_index = 1;
+            }
+
+            self.next_index.insert(peer_id, new_next_index);
+            tracing::info!(
+                node = self.id, peer = peer_id,
+                conflict_term = resp.conflict_term,
+                conflict_index = resp.conflict_index,
+                new_next_index,
+                "AppendEntries rejected, fast backup"
+            );
         }
     }
 
@@ -402,6 +447,7 @@ impl Raft {
             term,
             command,
         });
+        self.persist(&mut core);
         tracing::info!(node = self.id, index, term, "Appended new entry");
     }
 
@@ -540,6 +586,7 @@ impl Raft {
         core.term = term;
         core.voted_for = None;
         self.received_votes = 0;
+        self.persist(core);
     }
 
     fn become_candidate(&mut self, core: &mut RaftState) {
@@ -547,6 +594,7 @@ impl Raft {
         core.voted_for = Some(self.id);
         core.term += 1;
         self.received_votes = 1;
+        self.persist(core);
     }
 
     fn become_leader(&mut self, core: &mut RaftState) {
