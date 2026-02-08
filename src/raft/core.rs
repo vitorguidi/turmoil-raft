@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use crate::pb::raft::{AppendEntriesRequest, AppendEntriesResponse,
      InstallSnapshotRequest, InstallSnapshotResponse, LogEntry,
       RequestVoteRequest, RequestVoteResponse};
+use crate::raft::log;
+use crate::raft::log::sentinel;
 use rand::Rng;
 use tokio::sync::{mpsc, oneshot};
 use crate::raft::client::RaftClient;
@@ -33,7 +35,7 @@ impl RaftState {
             term: 0,
             voted_for: None,
             role: Role::Follower,
-            log: Vec::new(),
+            log: vec![sentinel()],
             commit_index: 0,
             last_applied: 0,
         }
@@ -60,7 +62,12 @@ pub enum RaftMsg {
     },
     AppendEntriesResp {
         peer_id: u64,
+        prev_log_index: u64,
+        entries_len: u64,
         resp: AppendEntriesResponse,
+    },
+    Start {
+        command: Vec<u8>,
     },
     ElectionTimeout,
     HeartbeatTimeout,
@@ -80,9 +87,9 @@ pub struct Raft {
     election_jitter: u64,
     // Shared state for oracle inspection
     pub core: Arc<Mutex<RaftState>>,
-    // Volatile leader state
-    next_index: Vec<u64>,
-    match_index: Vec<u64>,
+    // Volatile leader state (reinitialized on election)
+    next_index: BTreeMap<u64, u64>,
+    match_index: BTreeMap<u64, u64>,
 }
 
 impl Raft {
@@ -97,7 +104,6 @@ impl Raft {
         election_jitter: u64,
         core: Arc<Mutex<RaftState>>,
     ) -> Self {
-        let nr_peers = peers.len();
         Self {
             id,
             received_votes: 0,
@@ -110,8 +116,8 @@ impl Raft {
             election_jitter,
             heartbeat_interval,
             core,
-            next_index: vec![0; nr_peers + 1],
-            match_index: vec![0; nr_peers + 1],
+            next_index: BTreeMap::new(),
+            match_index: BTreeMap::new(),
         }
     }
 
@@ -141,8 +147,11 @@ impl Raft {
                 RaftMsg::RequestVoteResp { peer_id, resp } => {
                     self.handle_request_vote_resp(peer_id, resp);
                 },
-                RaftMsg::AppendEntriesResp { peer_id, resp } => {
-                    self.handle_append_entries_resp(peer_id, resp);
+                RaftMsg::AppendEntriesResp { peer_id, prev_log_index, entries_len, resp } => {
+                    self.handle_append_entries_resp(peer_id, prev_log_index, entries_len, resp);
+                },
+                RaftMsg::Start { command } => {
+                    self.handle_start(command);
                 },
                 RaftMsg::ElectionTimeout => {
                     self.handle_election_timeout();
@@ -160,7 +169,6 @@ impl Raft {
     fn handle_append_entries_req(&mut self, req: AppendEntriesRequest) -> AppendEntriesResponse {
         let core_arc = self.core.clone();
         let mut core = core_arc.lock().unwrap();
-        tracing::info!(node = self.id, leader = req.leader_id, term = req.term, "Received AppendEntries");
 
         if req.term < core.term {
             return AppendEntriesResponse {
@@ -175,7 +183,76 @@ impl Raft {
             self.become_follower(&mut core, req.term);
         }
 
-        // TODO: log consistency check, append entries, advance commit_index
+        // Log consistency check (Figure 2)
+        if req.prev_log_index > 0 {
+            match log::term_at(&core.log, req.prev_log_index) {
+                None => {
+                    // Our log is too short
+                    tracing::info!(
+                        node = self.id, prev_log_index = req.prev_log_index,
+                        log_len = core.log.len(),
+                        "AppendEntries rejected: log too short"
+                    );
+                    return AppendEntriesResponse {
+                        term: core.term,
+                        success: false,
+                        conflict_index: core.log.len() as u64,
+                        conflict_term: 0,
+                    };
+                }
+                Some(t) if t != req.prev_log_term => {
+                    // Conflicting term at prev_log_index
+                    let conflict_term = t;
+                    let conflict_index = log::first_index_for_term(&core.log, conflict_term);
+                    tracing::info!(
+                        node = self.id, prev_log_index = req.prev_log_index,
+                        expected_term = req.prev_log_term, actual_term = t,
+                        conflict_index, conflict_term,
+                        "AppendEntries rejected: term mismatch"
+                    );
+                    return AppendEntriesResponse {
+                        term: core.term,
+                        success: false,
+                        conflict_index,
+                        conflict_term,
+                    };
+                }
+                _ => {} // Match — proceed
+            }
+        }
+
+        // Append entries, truncating conflicts
+        for entry in &req.entries {
+            let idx = entry.index as usize;
+            if idx < core.log.len() {
+                if core.log[idx].term != entry.term {
+                    // Conflict: truncate from here
+                    core.log.truncate(idx);
+                    core.log.push(entry.clone());
+                }
+                // else: already have this entry, skip
+            } else {
+                core.log.push(entry.clone());
+            }
+        }
+
+        // Advance commit_index
+        if req.leader_commit > core.commit_index {
+            let last_new_index = if req.entries.is_empty() {
+                log::last_log_index(&core.log)
+            } else {
+                req.entries.last().unwrap().index
+            };
+            core.commit_index = std::cmp::min(req.leader_commit, last_new_index);
+        }
+
+        tracing::info!(
+            node = self.id, leader = req.leader_id, term = req.term,
+            entries = req.entries.len(), commit = core.commit_index,
+            log_len = core.log.len(),
+            "AppendEntries accepted"
+        );
+
         AppendEntriesResponse {
             term: core.term,
             success: true,
@@ -199,7 +276,14 @@ impl Raft {
 
         let can_vote = core.voted_for.is_none() || core.voted_for == Some(req.candidate_id);
 
-        if can_vote {
+        // Election restriction (Section 5.4.1): candidate's log must be
+        // at least as up-to-date as ours.
+        let our_last_term = log::last_log_term(&core.log);
+        let our_last_index = log::last_log_index(&core.log);
+        let log_ok = req.last_log_term > our_last_term
+            || (req.last_log_term == our_last_term && req.last_log_index >= our_last_index);
+
+        if can_vote && log_ok {
             core.voted_for = Some(req.candidate_id);
             self.reset_election_timeout();
             tracing::info!(node = self.id, candidate = req.candidate_id, term = req.term, "Granting vote");
@@ -251,11 +335,17 @@ impl Raft {
             }
         }
         if become_leader {
-            self.send_heartbeats();
+            self.send_append_entries();
         }
     }
 
-    fn handle_append_entries_resp(&mut self, peer_id: u64, resp: AppendEntriesResponse) {
+    fn handle_append_entries_resp(
+        &mut self,
+        peer_id: u64,
+        prev_log_index: u64,
+        entries_len: u64,
+        resp: AppendEntriesResponse,
+    ) {
         let core_arc = self.core.clone();
         let mut core = core_arc.lock().unwrap();
         if resp.term > core.term {
@@ -266,9 +356,73 @@ impl Raft {
         if core.role != Role::Leader {
             return;
         }
-        tracing::info!(node = self.id, peer = peer_id, success = resp.success, "AppendEntries response");
-        // TODO: on success, advance next_index/match_index and try to advance commit_index
-        // TODO: on failure, decrement next_index and retry
+
+        if resp.success {
+            let new_match = prev_log_index + entries_len;
+            let current_match = self.match_index.get(&peer_id).copied().unwrap_or(0);
+            // Only advance — never go backwards from stale responses
+            if new_match > current_match {
+                self.match_index.insert(peer_id, new_match);
+                self.next_index.insert(peer_id, new_match + 1);
+                tracing::info!(
+                    node = self.id, peer = peer_id,
+                    match_index = new_match, next_index = new_match + 1,
+                    "Advanced peer indices"
+                );
+            }
+            let old_commit = core.commit_index;
+            self.maybe_advance_commit_index(&mut core);
+            if core.commit_index > old_commit {
+                tracing::info!(
+                    node = self.id,
+                    old_commit, new_commit = core.commit_index,
+                    "Commit index advanced"
+                );
+            }
+        } else {
+            // Simple backtracking: decrement next_index (fast backup in Phase 3)
+            let ni = self.next_index.get(&peer_id).copied().unwrap_or(1);
+            if ni > 1 {
+                self.next_index.insert(peer_id, ni - 1);
+            }
+            tracing::info!(node = self.id, peer = peer_id, next_index = ni - 1, "AppendEntries rejected, backing up");
+        }
+    }
+
+    fn handle_start(&mut self, command: Vec<u8>) {
+        let core_arc = self.core.clone();
+        let mut core = core_arc.lock().unwrap();
+        if core.role != Role::Leader {
+            return;
+        }
+        let index = log::last_log_index(&core.log) + 1;
+        let term = core.term;
+        core.log.push(LogEntry {
+            index,
+            term,
+            command,
+        });
+        tracing::info!(node = self.id, index, term, "Appended new entry");
+    }
+
+    fn maybe_advance_commit_index(&self, core: &mut RaftState) {
+        let last = log::last_log_index(&core.log);
+        for n in (core.commit_index + 1)..=last {
+            // Only commit entries from the current term (Figure 8 safety)
+            if core.log[n as usize].term != core.term {
+                continue;
+            }
+            // Count replicas: self + peers with match_index >= n
+            let mut count = 1u64; // self
+            for (_, &mi) in &self.match_index {
+                if mi >= n {
+                    count += 1;
+                }
+            }
+            if count >= self.quorum() as u64 {
+                core.commit_index = n;
+            }
+        }
     }
 
     fn handle_election_timeout(&mut self) {
@@ -279,14 +433,17 @@ impl Raft {
         }
         self.become_candidate(&mut core);
         let term = core.term;
-        drop(core); // Drop lock before spawning tasks
+        let last_log_index = log::last_log_index(&core.log);
+        let last_log_term = log::last_log_term(&core.log);
+        drop(core);
 
         tracing::info!(node = self.id, term = term, "Starting election");
 
         let req = RequestVoteRequest {
             term,
             candidate_id: self.id,
-            ..Default::default()
+            last_log_index,
+            last_log_term,
         };
 
         for (&peer_id, peer) in &self.peers {
@@ -306,7 +463,7 @@ impl Raft {
         }
     }
 
-    // -- heartbeats --
+    // -- log replication / heartbeats --
 
     fn handle_heartbeat_timeout(&mut self) {
         let core = self.core.lock().unwrap();
@@ -314,28 +471,49 @@ impl Raft {
             return;
         }
         drop(core);
-        self.send_heartbeats();
+        self.send_append_entries();
     }
 
-    fn send_heartbeats(&self) {
+    fn send_append_entries(&self) {
         let core = self.core.lock().unwrap();
         let term = core.term;
         let commit_index = core.commit_index;
-        drop(core);
+        let log_len = core.log.len();
 
         for (&peer_id, peer) in &self.peers {
+            let ni = self.next_index.get(&peer_id).copied().unwrap_or(1);
+            tracing::debug!(
+                node = self.id, peer = peer_id, ni, log_len, commit_index,
+                "Sending AppendEntries"
+            );
+            let prev_log_index = ni - 1;
+            let prev_log_term = core.log.get(prev_log_index as usize)
+                .map(|e| e.term)
+                .unwrap_or(0);
+
+            let entries: Vec<LogEntry> = core.log[ni as usize..].to_vec();
+            let entries_len = entries.len() as u64;
+
             let req = AppendEntriesRequest {
                 term,
                 leader_id: self.id,
+                prev_log_index,
+                prev_log_term,
+                entries,
                 leader_commit: commit_index,
-                ..Default::default()
             };
+
             let peer = peer.clone();
             let tx = self.tx.clone();
             tokio::spawn(async move {
                 match peer.append_entries(req).await {
                     Ok(resp) => {
-                        let _ = tx.send(RaftMsg::AppendEntriesResp { peer_id, resp }).await;
+                        let _ = tx.send(RaftMsg::AppendEntriesResp {
+                            peer_id,
+                            prev_log_index,
+                            entries_len,
+                            resp,
+                        }).await;
                     },
                     Err(e) => {
                         tracing::warn!(peer = peer_id, "AppendEntries RPC failed: {}", e);
@@ -374,5 +552,12 @@ impl Raft {
     fn become_leader(&mut self, core: &mut RaftState) {
         tracing::info!(node = self.id, term = core.term, "Became leader");
         core.role = Role::Leader;
+        let last = log::last_log_index(&core.log);
+        self.next_index.clear();
+        self.match_index.clear();
+        for &peer_id in self.peers.keys() {
+            self.next_index.insert(peer_id, last + 1);
+            self.match_index.insert(peer_id, 0);
+        }
     }
 }
