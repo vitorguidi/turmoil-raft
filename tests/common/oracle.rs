@@ -101,10 +101,14 @@ impl Oracle {
             .map(|(i, s)| (i, s.term))
             .collect();
 
-        let max_leader_term = leaders.iter().map(|(_, t)| *t).max();
+        // A leader is stale (zombie) if any server in the cluster has
+        // already moved to a higher term.  Only check leaders whose term
+        // equals the global max — those are the only ones whose log is
+        // still authoritative.
+        let max_term = states.iter().map(|s| s.term).max().unwrap_or(0);
 
         for (leader_idx, leader_term) in leaders {
-            if Some(leader_term) != max_leader_term {
+            if leader_term < max_term {
                 continue;
             }
 
