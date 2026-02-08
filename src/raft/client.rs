@@ -7,6 +7,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Factory that creates fresh tonic channels (new TCP connections).
+///
+/// Tonic's `Channel` multiplexes all RPCs over a single HTTP/2 connection.
+/// When the underlying TCP stream is corrupted (e.g. turmoil's `fail_rate`
+/// dropping TCP segments, or a network partition killing the connection),
+/// the entire HTTP/2 session becomes unusable. Tonic's built-in reconnect
+/// (`tower::reconnect::Reconnect`) often fails to recover because the
+/// corrupted connection isn't cleanly closed — it's stuck in a zombie state.
+///
+/// The workaround: on transport errors (`Unavailable`/`Internal`), we replace
+/// the channel with a brand-new one from this factory, establishing a fresh
+/// TCP connection. We don't retry the failed RPC — Raft's heartbeat cycle
+/// (every ~150ms) naturally retries by sending the next AppendEntries or
+/// RequestVote on the now-healthy connection.
+///
+/// See: https://github.com/tokio-rs/turmoil/issues/185
 pub type ChannelFactory = Arc<dyn Fn() -> Channel + Send + Sync>;
 
 #[derive(Clone)]
@@ -34,10 +49,7 @@ impl RaftClient {
         }
     }
 
-    const MAX_RETRIES: u32 = 3;
-    const RETRY_DELAY_MS: u64 = 50;
-
-    /// Reconnect: create a fresh channel and tonic client.
+    /// Replace the inner channel with a fresh TCP connection.
     fn reconnect(&mut self) {
         let channel = (self.channel_factory)();
         self.inner = TonicRaftClient::new(channel);
@@ -45,32 +57,24 @@ impl RaftClient {
 
     async fn invoke<Req, Res, F, Fut>(&mut self, req: Req, f: F) -> Result<Res, Status>
     where
-        Req: Clone,
-        F: Fn(TonicRaftClient<Channel>, tonic::Request<Req>) -> Fut,
+        F: FnOnce(TonicRaftClient<Channel>, tonic::Request<Req>) -> Fut,
         Fut: std::future::Future<Output = Result<tonic::Response<Res>, Status>>,
     {
-        let mut last_err = Status::internal("no attempts made");
-        for attempt in 0..=Self::MAX_RETRIES {
-            let client = self.inner.clone();
-            let mut req = tonic::Request::new(req.clone());
-            req.set_timeout(self.timeout);
-            match f(client, req).await {
-                Ok(resp) => return Ok(resp.into_inner()),
-                Err(status) if Self::is_retryable(&status) => {
-                    last_err = status;
-                    // Create a completely fresh channel to bypass the broken HTTP/2 connection
+        let client = self.inner.clone();
+        let mut req = tonic::Request::new(req);
+        req.set_timeout(self.timeout);
+        match f(client, req).await {
+            Ok(resp) => Ok(resp.into_inner()),
+            Err(status) => {
+                if Self::is_transport_error(&status) {
                     self.reconnect();
-                    if attempt < Self::MAX_RETRIES {
-                        tokio::time::sleep(Duration::from_millis(Self::RETRY_DELAY_MS)).await;
-                    }
                 }
-                Err(status) => return Err(status),
+                Err(status)
             }
         }
-        Err(last_err)
     }
 
-    fn is_retryable(status: &Status) -> bool {
+    fn is_transport_error(status: &Status) -> bool {
         matches!(
             status.code(),
             tonic::Code::Unavailable | tonic::Code::Internal

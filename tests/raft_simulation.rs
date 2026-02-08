@@ -144,29 +144,6 @@ fn ping_test() -> turmoil::Result {
     // let mut partitions: std::collections::BTreeSet<(usize, usize)> = std::collections::BTreeSet::new();
 
     for step in 0..MAX_STEPS {
-        // // Network chaos: ~1 in 2000 steps, flip a coin
-        // if rng.lock().unwrap().gen_ratio(1, 2000) {
-        //     let disconnect = rng.lock().unwrap().gen_bool(0.5);
-        //     if disconnect && step < 150000 {
-        //         // Pick a random pair to disconnect
-        //         let a = rng.lock().unwrap().gen_range(0..servers.len());
-        //         let b = (a + rng.lock().unwrap().gen_range(1..servers.len())) % servers.len();
-        //         let pair = (a.min(b), a.max(b));
-        //         if !partitions.contains(&pair) {
-        //             tracing::info!(step, a = pair.0 + 1, b = pair.1 + 1, "CHAOS: partitioning");
-        //             sim.partition(servers[pair.0].as_str(), servers[pair.1].as_str());
-        //             partitions.insert(pair);
-        //         }
-        //     } else if !partitions.is_empty() {
-        //         // Pick a random active partition to repair
-        //         let idx = rng.lock().unwrap().gen_range(0..partitions.len());
-        //         let pair = *partitions.iter().nth(idx).unwrap();
-        //         tracing::info!(step, a = pair.0 + 1, b = pair.1 + 1, "CHAOS: repairing");
-        //         sim.repair(servers[pair.0].as_str(), servers[pair.1].as_str());
-        //         partitions.remove(&pair);
-        //     }
-        // }
-
         sim.step()?;
         oracle.assert_invariants();
         if step % 1000 == 0 {
