@@ -101,7 +101,13 @@ impl Oracle {
             .map(|(i, s)| (i, s.term))
             .collect();
 
+        let max_leader_term = leaders.iter().map(|(_, t)| *t).max();
+
         for (leader_idx, leader_term) in leaders {
+            if Some(leader_term) != max_leader_term {
+                continue;
+            }
+
             let leader_state = &states[leader_idx];
             let leader_log = &leader_state.log;
 
