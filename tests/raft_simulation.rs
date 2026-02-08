@@ -81,6 +81,7 @@ fn run_simulation(config: SimConfig) -> turmoil::Result {
     let mut sim = turmoil::Builder::new()
         .enable_random_order()
         .fail_rate(config.network_fail_rate)
+        .tcp_capacity(65536)
         .build_with_rng(Box::new(SmallRng::seed_from_u64(config.seed)));
 
     sim.set_message_latency_curve((1.0 / config.latency_avg).into());
