@@ -204,6 +204,14 @@ fn run_simulation(config: SimConfig) -> turmoil::Result {
                  let name = format!("server-{}", victim_idx + 1);
                  tracing::warn!(step, target = ?name, "CRASHING");
                  sim.crash(name.as_str());
+                 // Reset volatile state so the oracle doesn't read stale
+                 // commit_index / role from the now-dead node.
+                 {
+                     let mut s = state_handles[victim_idx].lock().unwrap();
+                     s.commit_index = 0;
+                     s.last_applied = 0;
+                     s.role = Role::Follower;
+                 }
                  down_nodes.insert(victim_idx, step + config.bounce_delay);
              }
         }

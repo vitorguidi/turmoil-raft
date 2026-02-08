@@ -111,18 +111,9 @@ impl Raft {
         {
             let p = persister.lock().unwrap();
             let state_bytes = p.read_raft_state();
-            let mut c = core.lock().unwrap();
-
-            // Reset volatile state on recovery (Figure 2).
-            // In a real deployment, this happens naturally on process restart.
-            // Here, we share the RaftState with the simulation harness (which keeps it alive),
-            // so we must explicitly reset it to simulate a fresh start.
-            c.commit_index = 0;
-            c.last_applied = 0;
-            c.role = Role::Follower;
-
             if !state_bytes.is_empty() {
                 let (term, voted_for, log) = decode(state_bytes);
+                let mut c = core.lock().unwrap();
                 c.term = term;
                 c.voted_for = voted_for;
                 c.log = log;
