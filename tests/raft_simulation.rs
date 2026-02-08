@@ -21,6 +21,7 @@ fn ping_test() -> turmoil::Result {
     const ELECTION_INTERVAL: u32 = 300;
     const HEARTBEAT_INTERVAL: u32 = 150;
     const NR_NODES: u32 = 7;
+    const RNG_SEED: u64 = 42;
 
 
     let rng = Arc::new(Mutex::new(SmallRng::seed_from_u64(42)));
@@ -33,7 +34,7 @@ fn ping_test() -> turmoil::Result {
         // No failure rate for grpc yet
         // https://github.com/tokio-rs/turmoil/issues/185
         .fail_rate(0.01)
-        .build_with_rng(Box::new(SmallRng::seed_from_u64(42)));
+        .build_with_rng(Box::new(SmallRng::seed_from_u64(RNG_SEED)));
 
     // Exponential distribution with mean = 50ms (lambda = 1/50 = 0.02)
     sim.set_message_latency_curve((1.0 / LATENCY_AVG).into());
