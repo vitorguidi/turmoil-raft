@@ -17,6 +17,7 @@ fn ping_test() -> turmoil::Result {
     // oracle checking is O(nr_nodes*|log_size|^2, so lets be considerate
     const MAX_STEPS: u32 = 200000;
     const LATENCY_AVG: f64 = 50.0;
+    const NETWORK_FAIL_RATE: f64 = 0.01;
     const ELECTION_JITTER: u32 = 150;
     const ELECTION_INTERVAL: u32 = 300;
     const HEARTBEAT_INTERVAL: u32 = 150;
@@ -33,7 +34,7 @@ fn ping_test() -> turmoil::Result {
         .enable_random_order()
         // No failure rate for grpc yet
         // https://github.com/tokio-rs/turmoil/issues/185
-        .fail_rate(0.01)
+        .fail_rate(NETWORK_FAIL_RATE)
         .build_with_rng(Box::new(SmallRng::seed_from_u64(RNG_SEED)));
 
     // Exponential distribution with mean = 50ms (lambda = 1/50 = 0.02)
