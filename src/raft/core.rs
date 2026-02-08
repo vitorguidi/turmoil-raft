@@ -111,12 +111,22 @@ impl Raft {
         {
             let p = persister.lock().unwrap();
             let state_bytes = p.read_raft_state();
+            let mut c = core.lock().unwrap();
+
+            // Reset volatile state on recovery (Figure 2).
+            // In a real deployment, this happens naturally on process restart.
+            // Here, we share the RaftState with the simulation harness (which keeps it alive),
+            // so we must explicitly reset it to simulate a fresh start.
+            c.commit_index = 0;
+            c.last_applied = 0;
+            c.role = Role::Follower;
+
             if !state_bytes.is_empty() {
                 let (term, voted_for, log) = decode(state_bytes);
-                let mut c = core.lock().unwrap();
                 c.term = term;
                 c.voted_for = voted_for;
                 c.log = log;
+                tracing::info!(node=id, term, log_len=c.log.len(), "Restored from persistence");
             }
         }
 
@@ -267,12 +277,8 @@ impl Raft {
 
         // Advance commit_index
         if req.leader_commit > core.commit_index {
-            let last_new_index = if req.entries.is_empty() {
-                log::last_log_index(&core.log)
-            } else {
-                req.entries.last().unwrap().index
-            };
-            core.commit_index = std::cmp::min(req.leader_commit, last_new_index);
+            let last_match_index = req.prev_log_index + req.entries.len() as u64;
+            core.commit_index = std::cmp::max(core.commit_index, std::cmp::min(req.leader_commit, last_match_index));
         }
 
         tracing::info!(
@@ -467,6 +473,7 @@ impl Raft {
             }
             if count >= self.quorum() as u64 {
                 core.commit_index = n;
+                tracing::info!(node=self.id, commit_index=n, "Advanced commit index via quorum");
             }
         }
     }
