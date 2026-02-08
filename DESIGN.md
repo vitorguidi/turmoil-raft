@@ -1,899 +1,451 @@
-# Turmoil Raft Implementation Design
+# Turmoil Raft: Design & Architecture
 
-Low-level specification for implementing Raft (+ KV + Sharding) in Rust with
-Tonic gRPC and Turmoil deterministic simulation. Phases map to MIT 6.5840 labs.
+Raft consensus + linearizable KV store in Rust, tested via
+[Turmoil](https://github.com/tokio-rs/turmoil) deterministic simulation.
+Inspired by MIT 6.5840 (formerly 6.824).
 
-**Implementation order:**
+## Status
 
-| # | Phase | 6.5840 Lab | Difficulty |
-|---|-------|-----------|------------|
-| 0 | Networking & Boilerplate | -- | DONE |
-| 1 | Leader Election | 3A | Moderate |
-| 2 | Log Replication | 3B | Hard |
-| 3 | Persistence | 3C | Hard |
-| 4 | Log Compaction / Snapshots | 3D | Hard |
-| 5 | Fault-tolerant KV Service | 4A-4C | Hard |
-| 6 | Sharded KV | 5A-5D | Very Hard |
-
-**Critical reference:** Raft extended paper, **Figure 2**. Follow it religiously.
-Every `if` check, every field update, every invariant -- implement them all.
+| Phase | Description | Status |
+|-------|-------------|--------|
+| 0 | Networking & boilerplate | Done |
+| 1 | Leader election | Done |
+| 2 | Log replication | Done |
+| 3 | Persistence & fast backup | Done |
+| 4 | Log compaction / snapshots | Not started |
+| 5 | Fault-tolerant KV service | Done |
 
 ---
 
-## Phase 0: Networking & Boilerplate -- DONE
+## Architecture
 
-Tonic gRPC works inside Turmoil's simulated network. The bridge lives in
-`tests/common/mod.rs`.
-
-## Phase 1: Leader Election
-
-**Goal:** Nodes elect exactly one leader per term. Leader sends heartbeats.
-Followers that don't hear from a leader start elections. New leader elected
-within ~2 seconds of old leader failure.
-
-### File: `src/raft/core.rs`
-
-**Replace the `Raft` struct with full Figure 2 state:**
-
-```rust
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Role { Follower, Candidate, Leader }
-
-pub struct Raft {
-    // -- Identity --
-    id: u64,
-    peers: BTreeMap<u64, RaftClient>,
-
-    // -- Persistent state (Figure 2) --
-    current_term: u64,
-    voted_for: Option<u64>,
-    log: Vec<LogEntry>,          // 1-indexed: log[0] is a dummy sentinel
-
-    // -- Volatile state (all servers) --
-    commit_index: u64,
-    last_applied: u64,
-    role: Role,
-
-    // -- Volatile state (leader only, reinit on election) --
-    next_index: BTreeMap<u64, u64>,   // peer_id -> next log index to send
-    match_index: BTreeMap<u64, u64>,  // peer_id -> highest replicated index
-
-    // -- Channels --
-    rx: mpsc::Receiver<RaftMsg>,
-    apply_tx: mpsc::UnboundedSender<ApplyMsg>, // sends committed entries to state machine
-
-    // -- Timers --
-    election_deadline: tokio::time::Instant,  // randomized; reset on heartbeat/vote grant
-    heartbeat_interval: Duration,             // fixed ~100ms
-}
+```
+                      ┌──────────────────────────────────────────────┐
+                      │                   Server Host                │
+                      │                                              │
+  Clerk ──gRPC──────▶ │  KvServer ──RaftMsg::Start──▶ Raft core     │
+  (retry loop)        │     │                            │           │
+                      │     │◀── apply_rx (ApplyMsg) ────┘           │
+                      │     │                                        │
+                      │     ▼                                        │
+                      │  HashMap<K,V>  (state machine)               │
+                      │  dup_table     (deduplication)               │
+                      │                                              │
+                      │  Raft core ──gRPC──▶ Peer Raft cores        │
+                      │     │                                        │
+                      │     ▼                                        │
+                      │  Persister (Arc<Mutex<>>)                    │
+                      │  (survives turmoil crash/bounce)             │
+                      └──────────────────────────────────────────────┘
 ```
 
-**Key constants:**
-```rust
-const ELECTION_TIMEOUT_MIN_MS: u64 = 300;
-const ELECTION_TIMEOUT_MAX_MS: u64 = 500;
-const HEARTBEAT_INTERVAL_MS: u64 = 100;  // must be << election timeout
-```
-
-**`ApplyMsg` enum** (used by all later phases):
-```rust
-pub enum ApplyMsg {
-    Command { index: u64, command: Vec<u8> },
-    Snapshot { index: u64, term: u64, data: Vec<u8> },  // Phase 4
-}
-```
-
-**`RaftMsg` enum -- add variants for client commands:**
-```rust
-pub enum RaftMsg {
-    AppendEntries {
-        req: AppendEntriesRequest,
-        reply: oneshot::Sender<AppendEntriesResponse>,
-    },
-    RequestVote {
-        req: RequestVoteRequest,
-        reply: oneshot::Sender<RequestVoteResponse>,
-    },
-    InstallSnapshot {
-        req: InstallSnapshotRequest,
-        reply: oneshot::Sender<InstallSnapshotResponse>,
-    },
-    // Phase 2: client submits a command
-    Start {
-        command: Vec<u8>,
-        reply: oneshot::Sender<StartResult>,
-    },
-    // Phase 2: query current state
-    GetState {
-        reply: oneshot::Sender<(u64, bool)>,  // (term, is_leader)
-    },
-}
-```
-
-**Public API** (called from outside via a handle):
-```rust
-/// RaftHandle is a cheap clone-able handle to send messages to the core loop.
-#[derive(Clone)]
-pub struct RaftHandle {
-    tx: mpsc::Sender<RaftMsg>,
-}
-
-impl RaftHandle {
-    /// Submit a command. Returns (index, term, is_leader).
-    /// Only the leader accepts commands; others return is_leader=false.
-    pub async fn start(&self, command: Vec<u8>) -> Result<StartResult, ()>;
-
-    /// Returns (current_term, is_leader).
-    pub async fn get_state(&self) -> Result<(u64, bool), ()>;
-}
-```
-
-**Main loop (`Raft::run`) -- rewrite with randomized election timer:**
-```rust
-pub async fn run(mut self) {
-    let mut heartbeat_interval = tokio::time::interval(self.heartbeat_interval);
-    loop {
-        tokio::select! { biased;
-            // 1. Process incoming RPCs and client requests (highest priority)
-            Some(msg) = self.rx.recv() => {
-                self.handle_msg(msg).await;
-            },
-            // 2. Election timeout fires
-            _ = tokio::time::sleep_until(self.election_deadline) => {
-                self.start_election().await;
-            },
-            // 3. Heartbeat timer (leader only sends; followers ignore)
-            _ = heartbeat_interval.tick() => {
-                if self.role == Role::Leader {
-                    self.send_heartbeats().await;
-                }
-            },
-        }
-        // After every iteration: apply committed entries
-        self.apply_committed();
-    }
-}
-```
-
-**`reset_election_timer()`:**
-- Set `election_deadline = Instant::now() + random(300..500)ms`.
-- Called on: startup, receiving valid AppendEntries, granting a vote.
-
-**`start_election()`:**
-1. `self.role = Candidate`
-2. `self.current_term += 1`
-3. `self.voted_for = Some(self.id)`
-4. Reset election timer (in case election stalls)
-5. `votes_received = 1` (self-vote)
-6. Send `RequestVote` to all peers in parallel (spawn tasks)
-7. Collect responses: if `vote_granted` and term matches, increment votes.
-   If `votes_received > peers.len() / 2`, become leader.
-
-**`become_leader()`:**
-- `self.role = Leader`
-- Initialize `next_index[peer] = last_log_index + 1` for all peers
-- Initialize `match_index[peer] = 0` for all peers
-- Immediately send heartbeats (empty AppendEntries) to assert authority
-
-**`handle_request_vote(req)` -- implement Figure 2 RequestVote RPC receiver:**
-1. If `req.term < self.current_term` -> reply `(current_term, false)`
-2. If `req.term > self.current_term` -> step down: `become_follower(req.term)`
-3. If `voted_for` is None or == `req.candidate_id`:
-   - **Election restriction (Section 5.4.1):** grant vote ONLY if candidate's
-     log is at least as up-to-date as ours:
-     - `req.last_log_term > our_last_term`, OR
-     - `req.last_log_term == our_last_term && req.last_log_index >= our_last_index`
-   - If granted: `voted_for = Some(req.candidate_id)`, reset election timer
-4. Reply `(current_term, vote_granted)`
-
-**`handle_append_entries(req)` -- implement Figure 2 AppendEntries RPC receiver:**
-1. If `req.term < self.current_term` -> reply `(current_term, false)`
-2. Reset election timer (we heard from a valid leader)
-3. If `req.term > self.current_term` -> `become_follower(req.term)`
-4. If `self.role == Candidate` -> `become_follower(req.term)` (leader established)
-5. **For Phase 1 (heartbeats only):** reply `(current_term, true)`.
-   Log consistency check and log manipulation are added in Phase 2.
-
-**`become_follower(term)`:**
-- `self.role = Follower`
-- `self.current_term = term`
-- `self.voted_for = None`
-
-**`step_down_if_stale(remote_term) -> bool`:**
-- Common helper: if `remote_term > self.current_term`, become follower, return true.
-- Called at the top of every RPC handler AND when processing RPC responses.
-
-**`apply_committed()`:**
-- While `last_applied < commit_index`:
-  - `last_applied += 1`
-  - Send `ApplyMsg::Command { index, command }` on `apply_tx`
-
-### File: `src/raft/rpc.rs`
-
-**Implement the `request_vote` handler** (currently `unimplemented!()`):
-- Same pattern as `append_entries`: create oneshot, wrap in `RaftMsg::RequestVote`,
-  send to core, await response.
-
-**Leave `install_snapshot` as `unimplemented!()` until Phase 4.**
-
-### File: `src/raft/log.rs`
-
-**Implement log helper methods:**
-```rust
-use crate::pb::raft::LogEntry;
-
-/// The log is 1-indexed. Index 0 is a dummy sentinel with term=0.
-/// self.log[0] = sentinel, self.log[1] = first real entry, etc.
-
-pub fn last_log_index(log: &[LogEntry]) -> u64;  // log.len() - 1
-pub fn last_log_term(log: &[LogEntry]) -> u64;   // log[last].term
-pub fn term_at(log: &[LogEntry], index: u64) -> Option<u64>;
-```
-
-### File: `tests/raft_election.rs`
-
-**Test `test_initial_election`:**
-1. Create 3-node cluster (same setup as ping_test, but with real election logic).
-2. Step simulation for ~2 seconds.
-3. Query all nodes via `RaftHandle::get_state()`.
-4. Assert exactly ONE node reports `is_leader=true`.
-5. Assert all nodes agree on the same term.
-
-**Test `test_reelection`:**
-1. Create 5-node cluster. Wait for leader.
-2. Partition the leader (turmoil: `sim.partition("server-X", "server-Y")`).
-3. Step simulation. Assert new leader elected among remaining nodes.
-4. Heal partition. Step simulation.
-5. Assert old leader stepped down (is now follower with higher term).
-6. Assert exactly one leader in the cluster.
-
-**Test `test_many_elections`:**
-1. Create 7-node cluster.
-2. Repeatedly: pick random nodes to partition, wait for election, heal, repeat.
-3. After each round: assert exactly one leader, all nodes agree on term.
-
-**How to run:** `cargo test --test raft_election`
+Every server host runs both a Raft service and a KV service on the same
+tonic gRPC server (port 9000). Clerks connect to all servers and retry
+across them until they find the current leader.
 
 ---
 
-## Phase 2: Log Replication
+## Source Layout
 
-**Goal:** Leader accepts commands via `start()`, replicates log entries to
-followers, advances `commit_index` when majority has replicated, and delivers
-committed entries on `apply_tx`.
-
-### File: `src/raft/core.rs`
-
-**Add `handle_msg` arm for `RaftMsg::Start`:**
-```rust
-RaftMsg::Start { command, reply } => {
-    if self.role != Role::Leader {
-        let _ = reply.send(StartResult { index: 0, term: 0, is_leader: false });
-        return;
-    }
-    let index = last_log_index(&self.log) + 1;
-    self.log.push(LogEntry { index, term: self.current_term, command });
-    // Trigger immediate replication (don't wait for next heartbeat)
-    self.send_append_entries_to_all().await;
-    let _ = reply.send(StartResult { index, term: self.current_term, is_leader: true });
-}
 ```
+src/
+├── lib.rs                  Module root
+├── pb/mod.rs               Generated protobuf code (raft + kv)
+├── raft/
+│   ├── mod.rs
+│   ├── core.rs             Raft state machine & event loop
+│   ├── log.rs              Log indexing helpers (sentinel, term_at, etc.)
+│   ├── rpc.rs              tonic gRPC handlers → dispatch to core via channels
+│   ├── client.rs           RaftClient with reconnect-on-error
+│   └── persist.rs          In-memory Persister (bincode serialization)
+└── kv/
+    ├── mod.rs
+    ├── server.rs           KvServer: gRPC handlers, applier loop, state machine
+    └── client.rs           Clerk: retry loop with leader tracking
 
-**Expand `send_heartbeats()` into `send_append_entries_to_all()`:**
-For each peer:
-1. `prev_log_index = next_index[peer] - 1`
-2. `prev_log_term = log[prev_log_index].term`
-3. `entries = log[next_index[peer]..]` (everything the peer hasn't seen)
-4. Send `AppendEntriesRequest { term, leader_id, prev_log_index, prev_log_term, entries, leader_commit: commit_index }`
-5. Spawn task to send and handle response.
+proto/
+├── raft.proto              RequestVote, AppendEntries, InstallSnapshot RPCs
+└── kv.proto                Get, PutAppend RPCs
 
-**Handle AppendEntries responses (in spawned task, send result back to core):**
+tests/
+├── common/
+│   ├── mod.rs              Turmoil ↔ tonic bridge, sim loop, GCS upload
+│   ├── config.rs           SimConfig (Default + random() for fuzzing)
+│   ├── oracle.rs           Raft safety invariants (4 properties)
+│   ├── linearizability_oracle.rs   TracedClerk + linearizability checker
+│   ├── raft_sim.rs         Raft-only simulation setup
+│   └── kv_sim.rs           Raft + KV simulation setup
+├── raft_simulation.rs      Raft-only deterministic simulation test
+├── kv_linearizability.rs   KV linearizability test with crashes
+└── simulation_harness.rs   Continuous fuzzing harness (local + k8s)
 
-Add a new `RaftMsg` variant:
-```rust
-RaftMsg::AppendEntriesReply {
-    peer_id: u64,
-    req_prev_log_index: u64,  // what we sent, for context
-    entries_len: u64,          // how many entries we sent
-    resp: AppendEntriesResponse,
-}
+k8s/
+└── k8s-deployment.yaml.tmpl   10-replica fuzzer deployment + GCP secret
+
+Dockerfile                  Multi-stage build for fuzzer binary
 ```
-
-Processing:
-- If `resp.success`:
-  - `match_index[peer] = req_prev_log_index + entries_len`
-  - `next_index[peer] = match_index[peer] + 1`
-  - Call `maybe_advance_commit_index()`
-- If `!resp.success`:
-  - If `resp.term > current_term` -> step down
-  - Else: decrement `next_index[peer]` (simple backtracking for now;
-    fast backup optimization added in Phase 3)
-
-**`maybe_advance_commit_index()`:**
-- For each index N from `commit_index+1` to `last_log_index`:
-  - Count peers where `match_index[peer] >= N` (include self)
-  - If count > (total_nodes / 2) AND `log[N].term == current_term`:
-    - `commit_index = N`
-- **Important:** only commit entries from the current term (Figure 8 safety).
-
-**Expand `handle_append_entries(req)` -- full log consistency check:**
-1. (Same term checks as Phase 1)
-2. **Consistency check:** if `prev_log_index > 0`:
-   - If our log doesn't have index `prev_log_index` -> reply false with
-     `conflict_index = len(log)`, `conflict_term = 0`
-   - If `log[prev_log_index].term != prev_log_term` -> reply false with
-     `conflict_term = log[prev_log_index].term`,
-     `conflict_index = first index where term == conflict_term`
-3. **Append entries:** for each entry in `req.entries`:
-   - If we have a conflicting entry at that index (different term), truncate
-     our log from that point onward
-   - Append the entry
-4. **Update commit_index:** `commit_index = min(req.leader_commit, index of last new entry)`
-5. Reply `(current_term, true)`
-
-### File: `src/raft/log.rs`
-
-**Add:**
-```rust
-/// Find first index with the given term (for conflict resolution).
-pub fn first_index_for_term(log: &[LogEntry], term: u64) -> u64;
-```
-
-### File: `tests/raft_replication.rs`
-
-**Test `test_basic_agree`:**
-1. 3-node cluster, wait for leader.
-2. Submit 3 commands via `start()` on the leader.
-3. Step simulation.
-4. Assert all 3 nodes have the same log entries.
-5. Assert `apply_tx` received all 3 commands on all nodes, in order.
-
-**Test `test_follower_failure`:**
-1. 3-node cluster, wait for leader.
-2. Submit a command. Verify all agree.
-3. Partition one follower.
-4. Submit another command. Verify the 2 remaining nodes agree.
-5. Heal partition. Step simulation.
-6. Verify the reconnected follower catches up.
-
-**Test `test_leader_failure`:**
-1. 5-node cluster, wait for leader.
-2. Submit a command. Verify all agree.
-3. Partition the leader.
-4. Submit a command to the new leader.
-5. Heal partition.
-6. Verify the old leader's log is reconciled (conflicting entries truncated).
-
-**Test `test_no_agree_without_majority`:**
-1. 5-node cluster, wait for leader.
-2. Partition so leader only has 1 follower (minority).
-3. Submit command to leader. Step simulation.
-4. Verify command is NOT committed (not enough replicas).
-5. Heal partition. Verify command eventually commits.
-
-**Test `test_concurrent_starts`:**
-1. 3-node cluster, wait for leader.
-2. Submit 5 commands concurrently (all at once).
-3. Verify all 5 are committed, in some consistent order, on all nodes.
-
-**How to run:** `cargo test --test raft_replication`
 
 ---
 
-## Phase 3: Persistence
+## Raft Core (`src/raft/core.rs`)
 
-**Goal:** Raft nodes survive crashes. After `turmoil::sim.crash(node)` +
-`sim.bounce(node)`, the node restores its state and rejoins the cluster.
+### State
 
-### Important: Turmoil does NOT mock the filesystem
+```
+RaftState (shared via Arc<Mutex<>>):
+  term, voted_for, role          Persistent (Figure 2)
+  log: Vec<LogEntry>             Persistent; sentinel at index 0
+  commit_index, last_applied     Volatile
 
-We need an in-memory `Persister` abstraction, shared between the Raft core
-and the test harness via `Arc<Mutex<_>>`. Turmoil preserves host-local `Arc`
-state across crash/bounce if the host closure re-reads from it.
-
-### File: `src/raft/persist.rs` (NEW)
-
-```rust
-use serde::{Serialize, Deserialize};
-use crate::pb::raft::LogEntry;
-
-#[derive(Serialize, Deserialize)]
-pub struct PersistentState {
-    pub current_term: u64,
-    pub voted_for: Option<u64>,
-    pub log: Vec<LogEntry>,  // LogEntry needs Serialize/Deserialize
-}
-
-/// In-memory persistence that survives simulated crashes.
-/// Shared via Arc<Mutex<Persister>> between test harness and Raft.
-pub struct Persister {
-    raft_state: Vec<u8>,
-    snapshot: Vec<u8>,       // Phase 4
-}
-
-impl Persister {
-    pub fn new() -> Self;
-    pub fn save_raft_state(&mut self, data: Vec<u8>);
-    pub fn read_raft_state(&self) -> Vec<u8>;
-    pub fn save_snapshot(&mut self, data: Vec<u8>);    // Phase 4
-    pub fn read_snapshot(&self) -> Vec<u8>;             // Phase 4
-    pub fn raft_state_size(&self) -> usize;             // Phase 4
-}
+Raft (private, owned by event loop):
+  peers: BTreeMap<u64, RaftClient>
+  next_index, match_index        Volatile leader state
+  persister: Arc<Mutex<Persister>>
+  apply_tx                       Channel to KV applier
+  received_votes                 Vote counter during elections
 ```
 
-### File: `src/raft/core.rs`
+`RaftState` is behind `Arc<Mutex<>>` so the test oracle can inspect it
+from outside the host without going through RPCs.
 
-**Add `persister: Arc<Mutex<Persister>>` field to `Raft`.**
+### Event Loop
 
-**`persist()` method:**
-- Serialize `PersistentState { current_term, voted_for, log }` with `bincode`.
-- Call `persister.lock().save_raft_state(bytes)`.
-- **Called after every mutation to `current_term`, `voted_for`, or `log`.**
+The core runs a single `tokio::select! { biased; ... }` loop:
 
-**`restore()` method:**
-- Called in `Raft::new()` before entering the main loop.
-- Read bytes from `persister.lock().read_raft_state()`.
-- If non-empty, deserialize and populate fields.
+1. **Message received** (highest priority) — RPC request/response or client
+   `Start` command. Dispatched to `handle_*` methods.
+2. **Election timeout** — becomes candidate, increments term, requests votes.
+3. **Heartbeat tick** — leader sends AppendEntries to all peers.
 
-**Add fast log backup optimization to AppendEntries rejection handling:**
+After every iteration: `apply_committed()` sends newly committed entries
+to the KV layer via `apply_tx`.
 
-When leader receives a failed AppendEntries response:
-- **Case 1:** `conflict_term == 0` (follower's log is too short):
-  `next_index[peer] = conflict_index`
-- **Case 2:** `conflict_term > 0`, leader HAS entries with `conflict_term`:
-  `next_index[peer] = last_index_of(conflict_term) + 1`
-- **Case 3:** `conflict_term > 0`, leader does NOT have `conflict_term`:
-  `next_index[peer] = conflict_index`
+### Key Invariants
 
-This replaces the simple `next_index -= 1` from Phase 2.
+- **Figure 8 safety**: `maybe_advance_commit_index()` only commits entries
+  whose term equals the leader's current term.
+- **Persistence**: `persist()` is called after every mutation to term,
+  voted_for, or log — before responding to any RPC.
+- **Fast backup**: On AppendEntries rejection, the follower returns
+  `conflict_term` and `conflict_index`. The leader skips back by entire
+  terms instead of decrementing next_index one at a time.
 
-### File: `src/raft/mod.rs`
+### RPC Dispatch
 
-Add `pub mod persist;`
+All three RPCs (`RequestVote`, `AppendEntries`, `InstallSnapshot`) follow
+the same pattern in `rpc.rs`:
 
-### File: `Cargo.toml`
+1. tonic handler receives protobuf request
+2. Creates a oneshot channel
+3. Sends `RaftMsg::*Req { req, reply }` to the core's mpsc channel
+4. Awaits the oneshot response
+5. Returns protobuf response to caller
 
-Add `bincode = "1"` to dependencies (or `serde_json` if you prefer readability
-during debugging).
-
-### File: `tests/raft_persistence.rs`
-
-**Test setup requires a different pattern** -- the `Persister` must be created
-outside the host closure so it survives crash/bounce:
-
-```rust
-let persister = Arc::new(Mutex::new(Persister::new()));
-let p = persister.clone();
-sim.host("server-1", move || {
-    let p = p.clone();
-    async move {
-        // Raft::new reads from persister on startup
-        let raft = Raft::new(1, rx, peers, p);
-        raft.run().await;
-    }
-});
-```
-
-**Test `test_persist_basic`:**
-1. 3-node cluster with persisters.
-2. Elect leader, submit a command, verify committed.
-3. Crash all 3 nodes (`sim.crash()`), then bounce all (`sim.bounce()`).
-4. Wait for new election.
-5. Verify the committed command is still in all logs.
-
-**Test `test_persist_more`:**
-1. 5-node cluster. Submit several commands.
-2. Crash 2 followers, bounce them. Verify they catch up.
-3. Crash the leader, bounce it. Verify new leader elected, old leader rejoins.
-4. Submit more commands. Verify everything committed on all nodes.
-
-**Test `test_figure8`:**
-Reproduce the Figure 8 scenario from the Raft paper:
-1. 5-node cluster. Leader commits entry in term 2.
-2. Partition leader. New leader in term 3 commits different entry at same index.
-3. Heal. Verify the term-2 entry is overwritten by the term-3 entry.
-4. This tests that leaders only commit entries from their current term.
-
-**Test `test_unreliable_agree`:**
-1. 5-node cluster with `sim.fail_rate(0.1)` (10% message loss).
-2. Submit 50 commands in a loop.
-3. Verify all eventually committed on all nodes.
-
-**How to run:** `cargo test --test raft_persistence`
+This keeps all state mutations on a single task (no locking needed inside
+the core loop).
 
 ---
 
-## Phase 4: Log Compaction / Snapshots
+## Tonic + Turmoil Bridge (`tests/common/mod.rs`)
 
-**Goal:** State machine can take a snapshot, discarding old log entries.
-Leader sends snapshots to slow followers via InstallSnapshot RPC.
+Turmoil simulates the network but doesn't provide a real TCP stack.
+The bridge code makes tonic work inside turmoil:
 
-### File: `src/raft/core.rs`
+- **`incoming::Accepted`** wraps `turmoil::net::TcpStream` to implement
+  `AsyncRead`/`AsyncWrite`/`Connected` for tonic's server.
+- **`connector::connector()`** is a `tower::Service` that creates turmoil
+  TCP connections from a URI, used by tonic's client.
+- **`listener_stream()`** converts a turmoil `TcpListener` into a
+  `ReceiverStream` that tonic's server can accept connections from.
+- **`create_channel()`** creates a lazy tonic `Channel` with HTTP/2
+  keepalive (500ms interval, 1s timeout) to detect dead connections
+  after partitions heal.
 
-**Add snapshot state to `Raft`:**
+### HTTP/2 Connection Corruption Caveat
+
+Turmoil's `crash()` destroys the server-side TCP state, but the client's
+HTTP/2 connection object doesn't know this. After a `bounce()`, the old
+connection is corrupted — tonic sees `h2` protocol errors or hangs.
+
+**Workaround** (`src/raft/client.rs`): `RaftClient` wraps the tonic client
+with a `ChannelFactory`. On any transport error (`Unavailable`, `Internal`),
+it replaces the entire channel with a fresh TCP connection:
+
 ```rust
-// Snapshot metadata (replaces discarded log prefix)
-snapshot_last_index: u64,  // last index included in snapshot
-snapshot_last_term: u64,   // term of that index
-```
-
-**Modify log indexing:**
-After snapshotting, `self.log` no longer starts at index 0. The sentinel at
-`log[0]` has `index = snapshot_last_index, term = snapshot_last_term`.
-All log access must go through helpers that translate global index to vec index:
-```rust
-fn vec_index(&self, global_index: u64) -> usize {
-    (global_index - self.snapshot_last_index) as usize
+pub fn reconnect(&mut self) {
+    let new_channel = (self.channel_factory)();
+    self.inner = TonicRaftClient::new(new_channel);
 }
-fn global_index(&self, vec_index: usize) -> u64 {
-    vec_index as u64 + self.snapshot_last_index
-}
 ```
 
-**`snapshot(index, data)` method** -- called by state machine (KV server):
-1. If `index <= snapshot_last_index`, ignore (already snapshotted past this).
-2. Trim `self.log`: keep only entries after `index`.
-3. Insert new sentinel: `LogEntry { index, term: log[index].term, command: vec![] }`.
-4. `snapshot_last_index = index`, `snapshot_last_term = term`.
-5. Persist both raft state AND snapshot via persister.
+The same pattern is used in `Clerk` (`src/kv/client.rs`). This is not a
+retry — Raft's heartbeat cycle naturally retries the RPC on the next tick.
 
-**`handle_install_snapshot(req)`:**
-1. If `req.term < current_term` -> reply with current term.
-2. Reset election timer.
-3. If `req.last_included_index <= snapshot_last_index` -> reply (already have it).
-4. Trim log: discard everything up to `req.last_included_index`.
-5. Update `snapshot_last_index`, `snapshot_last_term`.
-6. Save snapshot in persister.
-7. Send `ApplyMsg::Snapshot { ... }` on `apply_tx` so the state machine restores.
-
-**Leader: send InstallSnapshot instead of AppendEntries when `next_index[peer] <= snapshot_last_index`:**
-- The leader no longer has the entries the follower needs.
-- Send the full snapshot instead.
-
-**Add `RaftMsg::Snapshot` variant** (for state machine to request trimming):
+**Keepalive** is configured on channels to detect stale connections:
 ```rust
-RaftMsg::Snapshot { index: u64, data: Vec<u8> }
+.http2_keep_alive_interval(Duration::from_millis(500))
+.keep_alive_timeout(Duration::from_millis(1000))
 ```
 
-### File: `src/raft/rpc.rs`
-
-**Implement `install_snapshot`** (currently `unimplemented!()`):
-Same oneshot+mpsc pattern as the other RPCs.
-
-### File: `src/raft/log.rs`
-
-**Update all helpers** to account for `snapshot_last_index` offset.
-
-### File: `tests/raft_snapshot.rs`
-
-**Test `test_snapshot_basic`:**
-1. 3-node cluster. Submit 100 commands.
-2. Trigger snapshot at index 50 on all nodes (simulating state machine snapshot).
-3. Verify logs are trimmed on all nodes.
-4. Submit 50 more commands. Verify all committed.
-
-**Test `test_snapshot_install`:**
-1. 3-node cluster. Submit 50 commands.
-2. Partition a follower.
-3. Submit 100 more commands. Trigger snapshot at index 100 on leader+other follower.
-4. Heal partition. The lagging follower cannot catch up via AppendEntries
-   (leader discarded those entries). Leader must send InstallSnapshot.
-5. Verify follower catches up and all nodes agree.
-
-**Test `test_snapshot_crash`:**
-1. 3-node cluster. Submit commands. Snapshot.
-2. Crash all nodes. Bounce.
-3. Verify snapshot + remaining log entries are intact.
-4. Submit more commands. Verify committed.
-
-**How to run:** `cargo test --test raft_snapshot`
+Without keepalive, a healed partition could leave dead connections open
+indefinitely, preventing new RPCs from reaching the peer.
 
 ---
 
-## Phase 5: Fault-tolerant KV Service
+## KV Service
 
-**Goal:** A linearizable key-value store replicated across a Raft cluster.
-Clients see a single, consistent system even when a minority of servers fail.
+### KvServer (`src/kv/server.rs`)
 
-This phase has 3 sub-parts:
-- **5A:** RSM (Replicated State Machine) layer
-- **5B:** KV service without snapshots
-- **5C:** KV service with snapshots
+The KV server owns the state machine and talks to Raft through channels:
 
-### File: `src/rsm.rs` (NEW) -- Phase 5A
+**Request path** (`submit_and_wait`):
+1. Serialize `KvOp` (Get/Put/Append + client_id + seq_num) to bincode
+2. Send `RaftMsg::Start { command, reply }` to Raft core
+3. If not leader → return `wrong_leader`
+4. Register a `PendingOp { term, tx }` in the pending map, keyed by log index
+5. Await the oneshot with 5-second timeout
 
-The RSM layer sits between the service (KV) and Raft. It handles:
-- Submitting operations to Raft
-- Waiting for them to be committed and applied
-- Detecting leadership changes
-- Deduplicating client requests
+**Apply path** (`run_applier`, spawned as background task):
+1. Receive `ApplyMsg::Command { index, term, command }` from Raft
+2. Deserialize `KvOp`, check dup_table (client_id → last seq_num)
+3. If duplicate → return cached result
+4. Execute on `HashMap<String, String>` store
+5. Update dup_table
+6. If pending map has an entry at this index with matching term → send result
+7. If term mismatch → drop the oneshot (caller gets `wrong_leader`)
 
-```rust
-/// Generic replicated state machine layer.
-pub struct Rsm<S: StateMachine> {
-    raft: RaftHandle,
-    apply_rx: mpsc::UnboundedReceiver<ApplyMsg>,
-    state_machine: S,
-    // Pending requests: index -> oneshot sender for the result
-    pending: HashMap<u64, oneshot::Sender<Option<Vec<u8>>>>,
-    // Term when each pending request was submitted (to detect leader changes)
-    pending_terms: HashMap<u64, u64>,
-}
+**Deduplication**: Every `KvOp` carries `client_id` + `seq_num`. The
+dup_table maps `client_id → (last_seq_num, cached_result)`. If a clerk
+retries (same seq_num), the server returns the cached result instead of
+re-executing. This prevents double-applies on leader failover.
 
-pub trait StateMachine: Send + 'static {
-    /// Apply an operation, return the result.
-    fn apply(&mut self, command: &[u8]) -> Vec<u8>;
-    /// Take a snapshot of current state.
-    fn snapshot(&self) -> Vec<u8>;
-    /// Restore from a snapshot.
-    fn restore(&mut self, data: &[u8]);
-}
+**Every Get goes through Raft** — no read-only optimization. This ensures
+linearizability: a stale leader cannot serve reads from its local state.
+
+### Clerk (`src/kv/client.rs`)
+
+```
+Clerk:
+  servers: Vec<(ChannelFactory, KvClient)>
+  leader_id: usize       Last known leader (round-robin on failure)
+  client_id: String       UUID, stable across retries
+  seq_num: u64            Monotonically increasing per operation
 ```
 
-**`Rsm::submit(command)` method:**
-1. Call `raft.start(command)`.
-2. If not leader, return `Err(WrongLeader)`.
-3. Record `(index, term)` and a oneshot channel in `pending`.
-4. Await the oneshot. If the committed entry at that index doesn't match
-   (different term or different command), return `Err(WrongLeader)` --
-   leadership changed and a different command was committed at that index.
-
-**`Rsm::run()` loop:**
-- Read from `apply_rx`.
-- For each `ApplyMsg::Command { index, command }`:
-  - Call `state_machine.apply(&command)` to get result.
-  - If `pending` has a waiter for this index AND the term matches:
-    send the result through the oneshot.
-  - Otherwise: still apply (the state machine must see all committed ops)
-    but nobody is waiting locally.
-- For each `ApplyMsg::Snapshot { data, .. }`:
-  - Call `state_machine.restore(&data)`.
-  - Clear all pending requests (stale after snapshot).
-
-### File: `src/kv/server.rs` -- Phase 5B
-
-```rust
-/// KV state machine implementing the StateMachine trait.
-pub struct KvStateMachine {
-    store: HashMap<String, String>,
-    // Duplicate detection: client_id -> (last_seq_num, last_result)
-    dup_table: HashMap<String, (u64, String)>,
-}
-```
-
-**`StateMachine::apply(command)` implementation:**
-1. Deserialize command into `KvOp` enum (Get/Put/Append with client_id + seq_num).
-2. **Duplicate detection:** if `dup_table[client_id].seq_num >= req.seq_num`,
-   return the cached result (already applied).
-3. Execute the operation:
-   - `Get(key)` -> return `store[key]` or empty string
-   - `Put(key, value)` -> `store[key] = value`
-   - `Append(key, value)` -> `store[key] += value`
-4. Update `dup_table[client_id] = (seq_num, result)`.
-5. Serialize and return the result.
-
-**Important:** Every Get MUST go through Raft (no read-only optimization).
-This ensures linearizability -- a stale leader cannot serve reads.
-
-**`KvOp` enum (serialized as the Raft command bytes):**
-```rust
-#[derive(Serialize, Deserialize)]
-pub enum KvOp {
-    Get { key: String, client_id: String, seq_num: u64 },
-    Put { key: String, value: String, client_id: String, seq_num: u64 },
-    Append { key: String, value: String, client_id: String, seq_num: u64 },
-}
-```
-
-**gRPC handlers (`impl Kv for KvServer`):**
-- `get(req)` / `put_append(req)`:
-  1. Serialize the operation into bytes.
-  2. Call `rsm.submit(bytes).await`.
-  3. If `Err(WrongLeader)` -> respond with `wrong_leader: true`.
-  4. If Ok -> deserialize result and respond.
-
-### File: `src/kv/client.rs` -- Phase 5B
-
-```rust
-/// Clerk keeps trying until it finds the leader.
-pub struct Clerk {
-    servers: Vec<KvClient>,   // Tonic clients to all KV servers
-    leader_id: usize,         // last known leader
-    client_id: String,        // unique, generated at creation
-    seq_num: u64,             // monotonically increasing
-}
-```
-
-**Retry loop for every operation:**
-```rust
-pub async fn get(&mut self, key: &str) -> String {
-    self.seq_num += 1;
-    loop {
-        let resp = self.servers[self.leader_id].get(req).await;
-        match resp {
-            Ok(r) if !r.wrong_leader => return r.value,
-            _ => {
-                self.leader_id = (self.leader_id + 1) % self.servers.len();
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }
-    }
-}
-```
-
-### Phase 5C: KV with Snapshots
-
-**Add to `KvServer`/`Rsm`:**
-- After applying each command, check `persister.raft_state_size()`.
-- If it exceeds a configurable `max_raft_state` threshold:
-  - Call `state_machine.snapshot()` to serialize the KV store + dup_table.
-  - Call `raft.snapshot(last_applied_index, snapshot_data)`.
-
-**`KvStateMachine::snapshot()`:** serialize `store` + `dup_table` with bincode.
-**`KvStateMachine::restore(data)`:** deserialize and replace `store` + `dup_table`.
-
-### File: `src/lib.rs`
-
-Add `pub mod rsm;`
-
-### File: `tests/kv_linearizability.rs`
-
-**Test `test_kv_basic`:**
-1. 3-node Raft cluster + KV servers. Create a Clerk.
-2. `put("a", "1")`, `get("a")` -> assert "1".
-3. `append("a", "2")`, `get("a")` -> assert "12".
-
-**Test `test_kv_leader_failure`:**
-1. 5-node cluster. Put some values.
-2. Partition the leader.
-3. Verify Clerk eventually finds new leader and operations succeed.
-4. Heal partition. Verify consistency.
-
-**Test `test_kv_concurrent`:**
-1. 5-node cluster. 5 Clerks concurrently issuing Put/Append/Get.
-2. Verify linearizability: the final state is consistent with SOME sequential
-   ordering of all operations.
-
-**Test `test_kv_unreliable`:**
-1. 5-node cluster with message loss.
-2. Multiple Clerks issuing operations.
-3. Verify no duplicates (seq_num dedup), eventual consistency.
-
-**Test `test_kv_snapshot`:**
-1. 3-node cluster with `max_raft_state = 1000` bytes.
-2. Issue enough Put operations to trigger multiple snapshots.
-3. Crash and restart nodes. Verify they restore from snapshot.
-4. Verify all operations still correct.
-
-**How to run:** `cargo test --test kv_linearizability`
+Every operation (get, put, append):
+1. Increment seq_num
+2. Send RPC to current leader_id
+3. If `wrong_leader` or RPC error → `next_leader()` (round-robin), sleep
+   100ms, retry
+4. On RPC error → reconnect the channel (turmoil connection corruption)
 
 ---
 
-## Phase 6: Sharded KV
+## Persistence (`src/raft/persist.rs`)
 
-**Goal:** Partition the key space across multiple Raft groups for horizontal
-scalability. A shard controller manages which group owns which shard.
+Turmoil does not simulate a filesystem. Instead, persistence uses an
+in-memory `Persister` shared via `Arc<Mutex<>>` between the Raft core
+and the test harness. Turmoil preserves host-local `Arc` state across
+`crash()`/`bounce()`, so the persisted data survives.
 
-*Detailed design to be written after Phase 5 is complete. High-level outline:*
+**What's persisted** (per Figure 2):
+- `current_term`
+- `voted_for`
+- `log: Vec<LogEntry>` (entire log)
 
-### Architecture
+**Serialization**: bincode. LogEntry is prost-generated (no serde), so
+entries are converted to `(index, term, command)` tuples for encoding.
 
-```
-                    ┌──────────────┐
-                    │ ShardCtrler  │  (Raft group -- stores config)
-                    │  (kvsrv)     │
-                    └──────┬───────┘
-                           │ Query/ChangeConfig
-            ┌──────────────┼──────────────┐
-            │              │              │
-     ┌──────┴──────┐ ┌────┴────┐ ┌──────┴──────┐
-     │ ShardGroup 1│ │ Group 2 │ │ ShardGroup 3│
-     │ (Raft+KV)   │ │(Raft+KV)│ │ (Raft+KV)   │
-     └─────────────┘ └─────────┘ └─────────────┘
-```
+**When persisted**: After every mutation to term, voted_for, or log, and
+before responding to any RPC.
 
-- **10 shards** (fixed). `shard = hash(key) % 10`.
-- **ShardConfig:** `{ num: u64, shards: [GroupId; 10], groups: HashMap<GroupId, Vec<ServerAddr>> }`
-- **ShardCtrler:** Raft-replicated config store. Supports `Query(num)` and
-  `ChangeConfigTo(new_config)`.
-- **ShardGroup:** Raft+KV group that handles a subset of shards. Rejects
-  requests for shards it doesn't own (`ErrWrongGroup`).
-
-### Sub-phases
-
-**6A -- Moving Shards:**
-- Controller tells source group to `FreezeShard(shard, config_num)`.
-- Source stops accepting writes for that shard.
-- Controller copies shard data from source: `GetShard(shard, config_num)`.
-- Controller installs at destination: `InstallShard(shard, data, config_num)`.
-- Controller deletes at source: `DeleteShard(shard, config_num)`.
-- Controller posts new config.
-- All shard RPCs are fenced with `config_num` for idempotency.
-
-**6B -- Handling Failed Controller:**
-- Store "current" and "next" config. On startup, detect incomplete transitions
-  and resume them.
-
-**6C -- Concurrent Controllers:**
-- Use versioned Puts to the config store so only one controller wins.
-- `config_num` fencing in shard RPCs prevents stale controllers from causing harm.
-
-### Files
-- `src/shard_ctrler/mod.rs` -- ShardCtrler service
-- `src/shard_kv/mod.rs` -- ShardGroup service (extends KV server with shard awareness)
-- `tests/shard_*.rs` -- test files
+The persister also has `save_snapshot()`/`read_snapshot()` methods, but
+these are not yet used (snapshot support is not implemented).
 
 ---
 
-## Incremental Testing Strategy
+## Testing Strategy
 
-Run tests in this exact order. Do not move to the next phase until all tests
-in the current phase pass reliably (run each test 10+ times).
+### 1. Safety Oracles (`tests/common/oracle.rs`)
+
+The `Oracle` holds `Arc<Mutex<RaftState>>` handles for every node and
+checks four Raft safety properties after every `sim.step()`:
+
+| Property | Check |
+|----------|-------|
+| **Election safety** | At most one leader per term (point-in-time snapshot) |
+| **Log matching** | Entries with same (index, term) have identical commands |
+| **State machine safety** | If two servers have applied entry at index N, they applied the same entry |
+| **Leader completeness** | Current leader's log contains all previously committed entries |
+
+Leader completeness ignores "zombie leaders" — nodes with `role == Leader`
+but whose term is less than the highest term in the cluster. These are
+stale leaders that haven't yet learned about the new term.
+
+### 2. Linearizability Oracle (`tests/common/linearizability_oracle.rs`)
+
+`TracedClerk` wraps `Clerk` and records every operation to an append-only
+`History` with `invoke_step` and `complete_step` timestamps (from a
+sim-step counter, not wall clock).
+
+`check_linearizability()` runs after every new history entry:
+
+1. Find the server with the highest `commit_index`
+2. Replay committed log entries with dedup (matching server behavior)
+3. For each Get in the history, verify the returned value matches the
+   replayed state
+4. **Real-time ordering**: if operation A completes before operation B
+   starts (`A.complete_step < B.invoke_step`), then A must appear before
+   B in the commit log
+
+### 3. Deterministic Simulation
+
+All tests use Turmoil for deterministic execution:
+
+- Virtual clock (no real-time waits)
+- Seeded RNG (`SmallRng::seed_from_u64`) for reproducible fault injection
+- `sim.step()` advances the simulation one tick at a time
+- Configurable network latency and failure rates
+
+**SimConfig** (`tests/common/config.rs`) captures all parameters needed
+to reproduce a test run:
+
+```rust
+SimConfig {
+    seed, max_steps,
+    latency_avg, network_fail_rate,
+    crash_probability, bounce_delay,
+    election_jitter, election_interval, heartbeat_interval,
+    nr_nodes, nr_clients,
+}
+```
+
+Same seed + same config = identical execution trace (verified empirically).
+
+### 4. Fault Injection
+
+The sim loop (`run_sim_loop` / `run_sim_loop_kv`) injects faults:
+
+- **Crashes**: At each step, with probability `crash_probability`, crash a
+  random node via `sim.crash()`. Reset its volatile state (commit_index,
+  last_applied, role).
+- **Bounces**: After `bounce_delay` steps, restart the crashed node via
+  `sim.bounce()`. It restores persistent state from the `Persister`.
+- **Quorum preservation**: At most 1 node down at a time (maintains
+  majority for progress). The KV linearizability test allows up to N-1
+  concurrent failures.
+- **Network failures**: Turmoil's `sim.set_fail_rate()` drops messages
+  randomly.
+
+### 5. Test Binaries
+
+| Test | What it tests |
+|------|---------------|
+| `cargo test --test raft_simulation` | Raft-only: elections, replication, persistence with crash/bounce. No KV layer. |
+| `cargo test --test kv_linearizability` | Full stack: Raft + KV + clients. Linearizability + safety oracles with crash/bounce. |
+| `cargo test --test simulation_harness` | Fuzzing harness (runs forever). Random configs, crash reports saved to disk + GCS. |
+
+### 6. Continuous Fuzzing (k8s)
+
+The `simulation_harness` test is packaged as a Docker image and deployed
+to Kubernetes (kind cluster) as 10 replicas:
+
+```
+                  ┌──────────────────────────┐
+                  │    k8s Deployment (10x)   │
+                  │                           │
+                  │  ┌────────────────────┐   │
+                  │  │  fuzzer binary      │   │
+                  │  │  (infinite loop)    │   │
+                  │  │                     │   │
+                  │  │  crash? ──▶ JSON    │   │
+                  │  │           ──▶ GCS   │   │
+                  │  └────────────────────┘   │
+                  └──────────────────────────┘
+```
+
+**Fuzzing loop** (`simulation_harness.rs`):
+1. Generate random `SimConfig`
+2. Run simulation inside `catch_unwind`
+3. On panic (invariant violation): save config as JSON, upload to GCS
+4. Repeat forever
+
+**Crash reproduction**:
+```bash
+FUZZ_MODE=reproduce FUZZ_FILE=crash-12345.json cargo test --test simulation_harness
+```
+
+The JSON contains the full `SimConfig`, so the exact fault sequence is
+replayed deterministically.
+
+**GCS upload** uses the `cloud-storage` crate, which reads credentials
+from the `SERVICE_ACCOUNT` env var (not `GOOGLE_APPLICATION_CREDENTIALS`).
+The upload is wrapped in `catch_unwind` to prevent credential/network
+issues from killing the fuzz loop.
+
+---
+
+## Known Caveats & Limitations
+
+### Snapshots not implemented
+`InstallSnapshot` RPC exists in the proto and has a stub handler, but
+log compaction is not implemented. The log grows unbounded. This is the
+next planned phase.
+
+### Dup table grows unbounded
+`KvServer.dup_table` stores the last seq_num and result for every client
+that has ever issued a request. It's never pruned. In a long-running
+fuzzer session this is fine (few clients), but production use would need
+pruning (e.g., on snapshot).
+
+### Apply channel backpressure
+`apply_committed()` uses `try_send` on the apply channel. If the KV
+applier falls behind, committed entries can be dropped. In practice this
+hasn't been observed because the applier processes entries faster than
+Raft commits them.
+
+### Turmoil TCP after crash
+After `sim.crash()` + `sim.bounce()`, existing TCP connections are dead
+but clients don't know. Both `RaftClient` and `Clerk` work around this
+by replacing the entire tonic channel on any transport error. The
+connection is not retried — Raft's heartbeat cycle or the clerk's retry
+loop handles the next attempt.
+
+### No real filesystem
+`Persister` is in-memory. It models crash-recovery correctly for
+simulation (state survives `crash()`/`bounce()` via `Arc`), but doesn't
+test real fsync semantics.
+
+### Single-node crash limit in Raft sim
+`run_sim_loop()` limits crashes to 1 concurrent node to always maintain
+quorum. The KV linearizability test (`kv_linearizability.rs`) allows up
+to N-1 concurrent failures, which can cause temporary liveness loss but
+should not violate safety.
+
+### Biased select
+The main Raft loop uses `tokio::select! { biased; ... }` to prioritize
+message processing over timeout handling. This prevents the election
+timer from firing while there are queued messages, reducing spurious
+elections.
+
+---
+
+## Running
 
 ```bash
-# Phase 0 -- already passing
-cargo test --test raft_ping
+# Raft-only simulation (default config, ~30s)
+cargo test --test raft_simulation -- --nocapture
 
-# Phase 1
-cargo test --test raft_election
+# KV linearizability (5 nodes, 3 clients, crashes, ~60s)
+cargo test --test kv_linearizability -- --nocapture
 
-# Phase 2
-cargo test --test raft_election      # must still pass!
-cargo test --test raft_replication
+# Local fuzz session (runs forever, Ctrl-C to stop)
+RUST_LOG=warn cargo test --test simulation_harness -- --nocapture
 
-# Phase 3
-cargo test --test raft_election      # must still pass!
-cargo test --test raft_replication   # must still pass!
-cargo test --test raft_persistence
+# Reproduce a crash
+FUZZ_MODE=reproduce FUZZ_FILE=crash-12345.json RUST_LOG=info \
+  cargo test --test simulation_harness -- --nocapture
 
-# Phase 4
-cargo test --test raft_election      # must still pass!
-cargo test --test raft_replication   # must still pass!
-cargo test --test raft_persistence   # must still pass!
-cargo test --test raft_snapshot
-
-# Phase 5
-cargo test --test kv_linearizability
-
-# Phase 6
-cargo test --test shard_basic
-cargo test --test shard_concurrent
-
-# Run everything
-cargo test
+# k8s fuzzing (requires kind cluster + GCP credentials)
+# See k8s/k8s-deployment.yaml.tmpl for template variables
 ```
-
-**Stress testing** (run 50 times to catch concurrency bugs):
-```bash
-for i in $(seq 1 50); do
-    echo "Run $i";
-    cargo test --test raft_persistence || { echo "FAILED on run $i"; break; };
-done
-```
-
----
-
-## Debugging Tips
-
-1. **Structured logging:** Use `tracing` with node id and term in every message:
-   ```rust
-   tracing::info!(node = self.id, term = self.current_term, role = ?self.role, "event");
-   ```
-
-2. **Deterministic replay:** Turmoil with a fixed seed (`SmallRng::seed_from_u64`)
-   gives reproducible runs. Change the seed to explore different orderings.
-
-3. **Common bugs:**
-   - Forgetting to reset election timer when granting a vote.
-   - Not stepping down when seeing a higher term in ANY RPC response.
-   - Committing entries from previous terms (violates Figure 8 safety).
-   - Off-by-one in log indexing (use the helpers in `log.rs`).
-   - Deadlock: blocking in the main `select!` loop on something that needs
-     the main loop to make progress (use spawned tasks for RPCs).
-   - Not persisting before responding to RPCs.
-
-4. **Assertions:** Add `debug_assert!` liberally:
-   ```rust
-   debug_assert!(self.commit_index <= last_log_index(&self.log));
-   debug_assert!(self.last_applied <= self.commit_index);
-   ```
