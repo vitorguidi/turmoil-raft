@@ -16,14 +16,17 @@ docker build -t turmoil-raft-fuzzer .
 To run the fuzzer locally (simulating the Kubernetes deployment):
 
 ```bash
+export $SA_PATH="gcs SA json key location"
+export FUZZ_IMAGE="image built in previous step"
 docker run --rm -it \
-  -e RAFT_FUZZ=1 \
+  -e RUST_LOG=INFO \
+  -e TEST_TYPE=kv \
   -e FUZZ_MODE=fuzz \
   -e MAX_STEPS=100000 \
   -e BUCKET_NAME=your-bucket-name \
   -e GOOGLE_APPLICATION_CREDENTIALS=/gcp/sa.json \
-  -v /path/to/your/service-account.json:/gcp/sa.json:ro \
-  turmoil-raft-fuzzer
+  -v $SA_PATH:/gcp/sa.json:ro \
+  $FUZZ_IMAGE
 ```
 
 *   `MAX_STEPS`: Number of simulation steps per run (default 1M).
@@ -42,8 +45,8 @@ If the fuzzer finds a crash, it saves a JSON configuration file (e.g., `crash-12
 
 ```bash
 # Set RUST_LOG to see details (info, debug, trace)
-RUST_LOG=info RAFT_FUZZ=1 FUZZ_MODE=reproduce FUZZ_FILE=repro.json \
-    cargo test --test raft_simulation raft_fuzz -- --nocapture
+RUST_LOG=info FUZZ_MODE=reproduce FUZZ_FILE=repro.json MAX_STEPS=100000 \
+    cargo test --test simulation_harness -- --nocapture
 ```
 
 This will run the simulation with the exact seed and parameters from the crash file, allowing you to debug the failure.

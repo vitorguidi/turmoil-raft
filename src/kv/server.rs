@@ -65,8 +65,10 @@ struct PendingOp {
 pub struct KvServer {
     raft_tx: mpsc::Sender<RaftMsg>,
     pending: Arc<Mutex<HashMap<u64, PendingOp>>>,
+    #[allow(dead_code)]
     store: Arc<Mutex<HashMap<String, String>>>,
     /// Dedup table: client_id -> (last_seq_num, last_result)
+    #[allow(dead_code)]
     dup_table: Arc<Mutex<HashMap<String, (u64, String)>>>,
 }
 

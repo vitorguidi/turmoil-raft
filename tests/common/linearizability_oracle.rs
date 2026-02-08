@@ -14,6 +14,7 @@ pub type StepClock = Arc<AtomicU64>;
 pub type History = Arc<Mutex<Vec<HistoryEntry>>>;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum HistoryOp {
     Get { key: String },
     Put { key: String, value: String },

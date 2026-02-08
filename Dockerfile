@@ -1,23 +1,18 @@
-# ---- Builder Stage ----
-# Use Debian Bullseye (older glibc) to ensure compatibility with the runner image
-FROM rust:1-bullseye AS builder
+FROM rust:1.84 AS builder
+WORKDIR /app
 
-# Install dependencies for tonic/prost (protobuf compiler)
-RUN apt-get update && apt-get install -y clang protobuf-compiler
+RUN apt-get update && apt-get install -y protobuf-compiler
 
-WORKDIR /usr/src/turmoil-raft
 COPY . .
 
-# Build the test binary in release mode.
-# We use --no-run to compile it without executing.
-RUN cargo test --test raft_simulation --no-run --release
-RUN find target/release/deps -name "raft_simulation-*" -type f -executable -exec cp {} /usr/local/bin/fuzzer \;
+# Build the test binary in release mode
+RUN cargo test --test simulation_harness --release --no-run
 
-# ---- Runner Stage ----
-FROM google/cloud-sdk:slim
+# Locate and move the binary (using find to avoid grep issues with hex hashes)
+RUN find target/release/deps -type f -name "simulation_harness*" ! -name "*.d" -exec cp {} /usr/local/bin/fuzzer \;
 
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/local/bin/fuzzer /usr/local/bin/fuzzer
 
-WORKDIR /app
-ENTRYPOINT ["/usr/local/bin/fuzzer"]
-CMD ["raft_fuzz", "--nocapture", "--test-threads=1"]
+CMD ["/usr/local/bin/fuzzer"]

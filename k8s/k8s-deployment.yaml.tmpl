@@ -2,8 +2,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: raft-fuzzer
-  labels:
-    app: raft-fuzzer
 spec:
   replicas: 10
   selector:
@@ -16,42 +14,21 @@ spec:
     spec:
       containers:
       - name: fuzzer
-        image: "${FUZZER_IMAGE}"
-        # IfNotPresent allows using the locally built image loaded into kind
-        imagePullPolicy: IfNotPresent
-        command: [
-          "/usr/local/bin/fuzzer",
-          "raft_fuzz",
-          "--nocapture",
-          "--test-threads=1"
-        ]
+        image: ${FUZZER_IMAGE}
         env:
-        - name: RAFT_FUZZ
-          value: "1"
-        - name: FUZZ_MODE
-          value: "fuzz"
+        - name: TEST_TYPE
+          value: "${TEST_TYPE}"
+        - name: MAX_STEPS
+          value: "500000"
         - name: BUCKET_NAME
           value: "${BUCKET_NAME}"
         - name: GOOGLE_APPLICATION_CREDENTIALS
-          value: "/etc/gcp/key.json"
-        - name: MAX_STEPS
-          value: "200000"
+          value: "/gcp/sa.json"
         volumeMounts:
-        - name: gcp-key-volume
-          mountPath: "/etc/gcp"
+        - name: gcp-key
+          mountPath: "/gcp"
           readOnly: true
       volumes:
-      - name: gcp-key-volume
+      - name: gcp-key
         secret:
-          secretName: gcp-sa-key
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: gcp-sa-key
-type: Opaque
-data:
-  # Run this command to generate the value:
-  # cat /path/to/your/gcp-sa-key.json | base64 | tr -d '\n'
-  key.json: ${GCP_KEY_BASE64}
----
+          secretName: gcp-key
