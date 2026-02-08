@@ -447,7 +447,7 @@ impl Raft {
         };
 
         for (&peer_id, peer) in &self.peers {
-            let peer = peer.clone();
+            let mut peer = peer.clone();
             let req = req.clone();
             let tx = self.tx.clone();
             tokio::spawn(async move {
@@ -503,7 +503,7 @@ impl Raft {
                 leader_commit: commit_index,
             };
 
-            let peer = peer.clone();
+            let mut peer = peer.clone();
             let tx = self.tx.clone();
             tokio::spawn(async move {
                 match peer.append_entries(req).await {
