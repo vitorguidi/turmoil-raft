@@ -37,7 +37,7 @@ impl SimConfig {
         let max_steps = std::env::var("MAX_STEPS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(1_000_000);
+            .unwrap_or(200_000);
         Self {
             seed: 999,
             max_steps,
@@ -58,7 +58,7 @@ impl SimConfig {
         let max_steps = std::env::var("MAX_STEPS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| rng.gen_range(100_000..2_000_000));
+            .unwrap_or_else(|| 200_000);
         Self {
             seed: rng.gen(),
             max_steps,

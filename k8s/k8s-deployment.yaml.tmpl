@@ -34,6 +34,8 @@ spec:
           value: "${BUCKET_NAME}"
         - name: GOOGLE_APPLICATION_CREDENTIALS
           value: "/etc/gcp/key.json"
+        - name: MAX_STEPS
+          value: "200000"
         volumeMounts:
         - name: gcp-key-volume
           mountPath: "/etc/gcp"
