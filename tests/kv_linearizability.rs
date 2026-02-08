@@ -6,8 +6,9 @@ use turmoil_raft::raft::{
 };
 use turmoil_raft::kv::{client::Clerk, server::KvServer};
 use rand::rngs::SmallRng;
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 use std::collections::BTreeMap;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -24,6 +25,9 @@ const ELECTION_INTERVAL: u64 = 300;
 const ELECTION_JITTER: u64 = 150;
 const RPC_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_STEPS: u32 = 200_000;
+const SEED: u64 = 777;
+const OP_DELAY_MIN_MS: u64 = 50;
+const OP_DELAY_MAX_MS: u64 = 500;
 
 fn build_kv_sim(seed: u64) -> (turmoil::Sim<'static>, Vec<Arc<Mutex<RaftState>>>) {
     let rng = Arc::new(Mutex::new(SmallRng::seed_from_u64(seed)));
@@ -109,110 +113,63 @@ fn build_kv_sim(seed: u64) -> (turmoil::Sim<'static>, Vec<Arc<Mutex<RaftState>>>
 }
 
 #[test]
-fn kv_basic_put_get() -> turmoil::Result {
+fn kv_linearizability_detsim() -> turmoil::Result {
     let _ = tracing_subscriber::fmt().without_time().try_init();
 
-    let (mut sim, _state_handles) = build_kv_sim(42);
+    let (mut sim, state_handles) = build_kv_sim(SEED);
 
-    sim.host("client", || async move {
-        // Give the cluster time to elect a leader
-        tokio::time::sleep(Duration::from_secs(2)).await;
+    let step_clock: StepClock = Arc::new(AtomicU64::new(0));
+    let history: History = Arc::new(Mutex::new(Vec::new()));
 
-        let mut factories = Vec::new();
-        for i in 1..=NR_NODES {
-            let addr = format!("server-{}:9000", i);
-            let factory: Arc<dyn Fn() -> tonic::transport::Channel + Send + Sync> =
-                Arc::new(move || create_channel(&addr));
-            factories.push(factory);
-        }
+    // Spawn 3 concurrent clients on separate hosts
+    for c in 0..3u32 {
+        let step_clock = step_clock.clone();
+        let history = history.clone();
 
-        let mut clerk = Clerk::new(factories, "client-1".to_string(), RPC_TIMEOUT);
+        sim.host(format!("client-{}", c).as_str(), move || {
+            let step_clock = step_clock.clone();
+            let history = history.clone();
+            async move {
+                let mut rng = SmallRng::seed_from_u64(SEED + c as u64 + 100);
 
-        // Put a value
-        clerk.put("key1".to_string(), "value1".to_string()).await;
+                let mut factories = Vec::new();
+                for i in 1..=NR_NODES {
+                    let addr = format!("server-{}:9000", i);
+                    let factory: Arc<dyn Fn() -> tonic::transport::Channel + Send + Sync> =
+                        Arc::new(move || create_channel(&addr));
+                    factories.push(factory);
+                }
 
-        // Get the value back
-        let val = clerk.get("key1".to_string()).await;
-        assert_eq!(val, "value1", "Expected 'value1', got '{}'", val);
+                let client_id = format!("client-{}", c);
+                let clerk = Clerk::new(factories, client_id.clone(), RPC_TIMEOUT);
+                let mut traced = TracedClerk::new(clerk, client_id, step_clock, history);
 
-        // Overwrite
-        clerk.put("key1".to_string(), "value2".to_string()).await;
-        let val = clerk.get("key1".to_string()).await;
-        assert_eq!(val, "value2");
+                loop {
+                    let delay_ms = rng.gen_range(OP_DELAY_MIN_MS..OP_DELAY_MAX_MS);
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 
-        // Append
-        clerk
-            .append("key1".to_string(), "_appended".to_string())
-            .await;
-        let val = clerk.get("key1".to_string()).await;
-        assert_eq!(val, "value2_appended");
-
-        // Get non-existent key
-        let val = clerk.get("missing".to_string()).await;
-        assert_eq!(val, "");
-
-        tracing::info!("All basic KV assertions passed!");
-        Ok(())
-    });
-
-    for _ in 0..MAX_STEPS {
-        sim.step()?;
+                    let key = format!("key-{}", rng.gen_range(0..5));
+                    match rng.gen_range(0..3u32) {
+                        0 => traced.put(key, format!("v-{}-{}", c, rng.gen::<u32>())).await,
+                        1 => traced.append(key, format!("+{}", c)).await,
+                        2 => { traced.get(key).await; }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        });
     }
 
-    Ok(())
-}
-
-#[test]
-fn kv_multiple_keys() -> turmoil::Result {
-    let _ = tracing_subscriber::fmt().without_time().try_init();
-
-    let (mut sim, _state_handles) = build_kv_sim(123);
-
-    sim.host("client", || async move {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        let mut factories = Vec::new();
-        for i in 1..=NR_NODES {
-            let addr = format!("server-{}:9000", i);
-            let factory: Arc<dyn Fn() -> tonic::transport::Channel + Send + Sync> =
-                Arc::new(move || create_channel(&addr));
-            factories.push(factory);
-        }
-
-        let mut clerk = Clerk::new(factories, "client-2".to_string(), RPC_TIMEOUT);
-
-        // Write multiple keys
-        for i in 0..10 {
-            clerk
-                .put(format!("key-{}", i), format!("val-{}", i))
-                .await;
-        }
-
-        // Read them all back
-        for i in 0..10 {
-            let val = clerk.get(format!("key-{}", i)).await;
-            assert_eq!(val, format!("val-{}", i));
-        }
-
-        // Append to each
-        for i in 0..10 {
-            clerk
-                .append(format!("key-{}", i), "-extra".to_string())
-                .await;
-        }
-
-        // Verify appends
-        for i in 0..10 {
-            let val = clerk.get(format!("key-{}", i)).await;
-            assert_eq!(val, format!("val-{}-extra", i));
-        }
-
-        tracing::info!("Multiple keys test passed!");
-        Ok(())
-    });
-
-    for _ in 0..MAX_STEPS {
+    let mut last_history_len = 0;
+    for step in 0..MAX_STEPS {
+        step_clock.store(step as u64, std::sync::atomic::Ordering::Relaxed);
         sim.step()?;
+
+        let h = history.lock().unwrap();
+        if h.len() > last_history_len {
+            check_linearizability(&h, &state_handles);
+            last_history_len = h.len();
+        }
     }
 
     Ok(())

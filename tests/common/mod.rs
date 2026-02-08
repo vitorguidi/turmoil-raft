@@ -1,6 +1,9 @@
 pub mod oracle;
 pub use oracle::*;
 
+pub mod linearizability_oracle;
+pub use linearizability_oracle::*;
+
 use hyper::Uri;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;

@@ -110,7 +110,6 @@ impl KvServer {
                         Ok(op) => op,
                         Err(e) => {
                             tracing::warn!(index, "Failed to deserialize KvOp: {}", e);
-                            // Resolve pending with error if any
                             if let Some(pending_op) = pending.lock().unwrap().remove(&index) {
                                 let _ = pending_op.tx.send(ApplyResult {
                                     value: String::new(),
@@ -121,15 +120,33 @@ impl KvServer {
                         }
                     };
 
+                    tracing::info!(
+                        index, term,
+                        client_id = %op.client_id(), seq_num = op.seq_num(),
+                        op = ?std::mem::discriminant(&op),
+                        "Applying committed entry"
+                    );
+
                     let result = Self::apply_op(&op, &store, &dup_table);
 
                     // Resolve pending request if term matches (same leader that proposed it)
                     if let Some(pending_op) = pending.lock().unwrap().remove(&index) {
                         if pending_op.term == term {
+                            tracing::info!(
+                                index, term,
+                                client_id = %op.client_id(), seq_num = op.seq_num(),
+                                "Resolved pending op (term match)"
+                            );
                             let _ = pending_op.tx.send(result);
+                        } else {
+                            tracing::warn!(
+                                index, term,
+                                pending_term = pending_op.term,
+                                client_id = %op.client_id(), seq_num = op.seq_num(),
+                                "Dropping pending op (term mismatch — leadership changed)"
+                            );
+                            // Oneshot dropped → waiting handler gets RecvError → wrong_leader
                         }
-                        // If term doesn't match, the oneshot is dropped and the
-                        // waiting handler gets a RecvError → returns wrong_leader.
                     }
                 }
             }
@@ -144,12 +161,16 @@ impl KvServer {
         let client_id = op.client_id().to_string();
         let seq_num = op.seq_num();
 
-        // Check dedup table (skip for Get — reads are idempotent but we still
-        // want linearizable ordering, so they go through Raft)
+        // Check dedup table
         {
             let dt = dup_table.lock().unwrap();
             if let Some((last_seq, last_result)) = dt.get(&client_id) {
                 if seq_num <= *last_seq {
+                    tracing::info!(
+                        client_id = %client_id, seq_num,
+                        last_seq = *last_seq,
+                        "Dedup hit — returning cached result"
+                    );
                     return ApplyResult {
                         value: last_result.clone(),
                         err: String::new(),
@@ -162,12 +183,22 @@ impl KvServer {
         let result = match op {
             KvOp::Get { key, .. } => {
                 let value = s.get(key).cloned().unwrap_or_default();
+                tracing::info!(
+                    client_id = %client_id, seq_num,
+                    key = %key, value = %value,
+                    "Applied Get"
+                );
                 ApplyResult {
                     value,
                     err: String::new(),
                 }
             }
             KvOp::Put { key, value, .. } => {
+                tracing::info!(
+                    client_id = %client_id, seq_num,
+                    key = %key, value = %value,
+                    "Applied Put"
+                );
                 s.insert(key.clone(), value.clone());
                 ApplyResult {
                     value: String::new(),
@@ -177,6 +208,11 @@ impl KvServer {
             KvOp::Append { key, value, .. } => {
                 let entry = s.entry(key.clone()).or_default();
                 entry.push_str(value);
+                tracing::info!(
+                    client_id = %client_id, seq_num,
+                    key = %key, appended = %value, new_value = %entry,
+                    "Applied Append"
+                );
                 ApplyResult {
                     value: String::new(),
                     err: String::new(),
