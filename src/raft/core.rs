@@ -69,9 +69,16 @@ pub enum RaftMsg {
     },
     Start {
         command: Vec<u8>,
+        reply: oneshot::Sender<(u64, u64, bool)>, // (index, term, is_leader)
     },
     ElectionTimeout,
     HeartbeatTimeout,
+}
+
+/// Messages sent from Raft to the state machine (KV layer) when entries are committed.
+#[derive(Debug)]
+pub enum ApplyMsg {
+    Command { index: u64, term: u64, command: Vec<u8> },
 }
 
 #[derive(Debug)]
@@ -90,6 +97,8 @@ pub struct Raft {
     pub core: Arc<Mutex<RaftState>>,
     // Persistent state
     persister: Arc<Mutex<Persister>>,
+    // Apply channel — delivers committed entries to the state machine (KV layer)
+    apply_tx: mpsc::Sender<ApplyMsg>,
     // Volatile leader state (reinitialized on election)
     next_index: BTreeMap<u64, u64>,
     match_index: BTreeMap<u64, u64>,
@@ -107,6 +116,7 @@ impl Raft {
         election_jitter: u64,
         core: Arc<Mutex<RaftState>>,
         persister: Arc<Mutex<Persister>>,
+        apply_tx: mpsc::Sender<ApplyMsg>,
     ) -> Self {
         {
             let p = persister.lock().unwrap();
@@ -134,6 +144,7 @@ impl Raft {
             heartbeat_interval,
             core,
             persister,
+            apply_tx,
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
         }
@@ -173,8 +184,8 @@ impl Raft {
                 RaftMsg::AppendEntriesResp { peer_id, prev_log_index, entries_len, resp } => {
                     self.handle_append_entries_resp(peer_id, prev_log_index, entries_len, resp);
                 },
-                RaftMsg::Start { command } => {
-                    self.handle_start(command);
+                RaftMsg::Start { command, reply } => {
+                    self.handle_start(command, reply);
                 },
                 RaftMsg::ElectionTimeout => {
                     self.handle_election_timeout();
@@ -184,6 +195,7 @@ impl Raft {
                     self.handle_heartbeat_timeout();
                 },
             }
+            self.apply_committed();
         }
     }
 
@@ -431,10 +443,11 @@ impl Raft {
         }
     }
 
-    fn handle_start(&mut self, command: Vec<u8>) {
+    fn handle_start(&mut self, command: Vec<u8>, reply: oneshot::Sender<(u64, u64, bool)>) {
         let core_arc = self.core.clone();
         let mut core = core_arc.lock().unwrap();
         if core.role != Role::Leader {
+            let _ = reply.send((0, 0, false));
             return;
         }
         let index = log::last_log_index(&core.log) + 1;
@@ -446,6 +459,28 @@ impl Raft {
         });
         self.persist(&mut core);
         tracing::info!(node = self.id, index, term, "Appended new entry");
+        let _ = reply.send((index, term, true));
+    }
+
+    fn apply_committed(&self) {
+        let mut core = self.core.lock().unwrap();
+        while core.last_applied < core.commit_index {
+            let next = core.last_applied + 1;
+            let entry = &core.log[next as usize];
+            match self.apply_tx.try_send(ApplyMsg::Command {
+                index: entry.index,
+                term: entry.term,
+                command: entry.command.clone(),
+            }) {
+                Ok(()) => {
+                    core.last_applied = next;
+                }
+                Err(_) => {
+                    tracing::warn!(node = self.id, index = next, "Apply channel full, will retry");
+                    break;
+                }
+            }
+        }
     }
 
     fn maybe_advance_commit_index(&self, core: &mut RaftState) {

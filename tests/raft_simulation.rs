@@ -132,7 +132,8 @@ fn run_simulation(config: SimConfig) -> turmoil::Result {
                     peers.insert(peer_id, RaftClient::new(factory, rpc_timeout));
                 }
 
-                Raft::new(self_id, tx, rx, peers, rng, config.heartbeat_interval.into(), config.election_interval.into(), config.election_jitter.into(), state, persister).run().await;
+                let (apply_tx, _apply_rx) = mpsc::channel(100);
+                Raft::new(self_id, tx, rx, peers, rng, config.heartbeat_interval.into(), config.election_interval.into(), config.election_jitter.into(), state, persister, apply_tx).run().await;
                 Ok(())
             }
         });
@@ -167,7 +168,8 @@ fn run_simulation(config: SimConfig) -> turmoil::Result {
                         };
                         if let Some(tx) = tx {
                             // try_send to avoid blocking if channel full
-                             let _ = tx.try_send(RaftMsg::Start { command: payload });
+                             let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+                             let _ = tx.try_send(RaftMsg::Start { command: payload, reply: reply_tx });
                         }
                     }
                 }
