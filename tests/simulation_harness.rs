@@ -17,14 +17,14 @@ fn simulation_harness() {
     let test_type = std::env::var("TEST_TYPE").unwrap_or_else(|_| "raft".to_string());
     let max_steps = std::env::var("MAX_STEPS").ok().and_then(|s| s.parse::<u32>().ok());
 
-    println!("Starting Simulation Harness. Mode: {}, Type: {}", mode, test_type);
+    eprintln!("Starting Simulation Harness. Mode: {}, Type: {}", mode, test_type);
 
     if mode == "reproduce" {
         let file_path = std::env::var("FUZZ_FILE").expect("FUZZ_FILE env var required for reproduce mode");
-        println!("Reproducing crash from {}", file_path);
+        eprintln!("Reproducing crash from {}", file_path);
         let data = std::fs::read(file_path).expect("Failed to read fuzz file");
         let config: SimConfig = serde_json::from_slice(&data).expect("Failed to deserialize config");
-        println!("Loaded config with seed: {}", config.seed);
+        eprintln!("Loaded config with seed: {}", config.seed);
         
         let result = match test_type.as_str() {
             "kv" => run_kv_simulation(config),
@@ -34,10 +34,10 @@ fn simulation_harness() {
         if let Err(e) = result {
             panic!("Reproduction failed (as expected): {:?}", e);
         } else {
-            println!("Reproduction finished without error (flaky test?)");
+            eprintln!("Reproduction finished without error (flaky test?)");
         }
     } else {
-        println!("Starting Fuzz Loop...");
+        eprintln!("Starting Fuzz Loop...");
         loop {
             let mut config = SimConfig::random();
             if let Some(steps) = max_steps {
@@ -59,8 +59,8 @@ fn simulation_harness() {
                 } else {
                     "Unknown panic".to_string()
                 };
-                println!("Test crashed! Panic: {}", msg);
-                println!("Saving report...");
+                eprintln!("Test crashed! Panic: {}", msg);
+                eprintln!("Saving report...");
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
@@ -69,11 +69,11 @@ fn simulation_harness() {
                 let json = serde_json::to_string_pretty(&config).unwrap();
                 
                 let _ = std::fs::write(&filename, &json);
-                println!("Saved locally to {}", filename);
+                eprintln!("Saved locally to {}", filename);
 
                 // Upload to GCS with folder structure: bucket/test_type/filename
                 let object_name = format!("{}/{}", test_type, filename);
-                println!("Uploading to gs://{}/{}", bucket, object_name);
+                eprintln!("Uploading to gs://{}/{}", bucket, object_name);
                 common::upload_to_gcs(&bucket, &object_name, &filename);
             }
         }

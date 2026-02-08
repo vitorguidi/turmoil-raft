@@ -17,7 +17,7 @@ spec:
         image: ${FUZZER_IMAGE}
         env:
         - name: RUST_LOG
-          value: "WARN"
+          value: "ERROR"
         - name: TEST_TYPE
           value: "${TEST_TYPE}"
         - name: MAX_STEPS
@@ -25,6 +25,8 @@ spec:
         - name: BUCKET_NAME
           value: "${BUCKET_NAME}"
         - name: GOOGLE_APPLICATION_CREDENTIALS
+          value: "/gcp/sa.json"
+        - name: SERVICE_ACCOUNT
           value: "/gcp/sa.json"
         volumeMounts:
         - name: gcp-key
@@ -42,5 +44,5 @@ metadata:
 type: Opaque
 data:
   # Run this command to generate the value:
-  # cat /path/to/your/gcp-sa-key.json | base64 | tr -d '\n'
-  key.json: ${GCP_KEY_BASE64}
+  # export GCP_KEY_BASE_64=$(cat ~/Desktop/detsim_sa.json | base64 | tr -d '\n')
+  sa.json: ${GCP_KEY_BASE64}

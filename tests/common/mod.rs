@@ -298,13 +298,17 @@ pub fn upload_to_gcs(bucket: &str, object_name: &str, filename: &str) {
     let object_name = object_name.to_string();
     let filename = filename.to_string();
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async {
-        let client = cloud_storage::Client::default();
-        let content = tokio::fs::read(&filename).await.unwrap();
-        match client.object().create(&bucket, content, &object_name, "application/json").await {
-            Ok(_) => println!("Upload successful"),
-            Err(e) => println!("Upload failed: {:?}", e),
-        }
-    });
+    if let Err(e) = std::panic::catch_unwind(|| {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let client = cloud_storage::Client::default();
+            let content = tokio::fs::read(&filename).await.unwrap();
+            match client.object().create(&bucket, content, &object_name, "application/json").await {
+                Ok(_) => eprintln!("Upload successful"),
+                Err(e) => eprintln!("Upload failed: {:?}", e),
+            }
+        });
+    }) {
+        eprintln!("GCS upload panicked: {:?}", e);
+    }
 }
