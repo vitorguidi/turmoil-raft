@@ -143,15 +143,11 @@ impl Raft {
             let p = persister.lock().unwrap();
             let state_bytes = p.read_raft_state();
             if !state_bytes.is_empty() {
-                let (term, voted_for, restored_log) = decode(state_bytes);
+                let (term, voted_for, restored_log, restored_debug_log) = decode(state_bytes);
                 let mut c = core.lock().unwrap();
                 c.term = term;
                 c.voted_for = voted_for;
-                for e in &restored_log {
-                    if !e.command.is_empty() {
-                        c.debug_log.insert(e.index, e.command.clone());
-                    }
-                }
+                c.debug_log = restored_debug_log;
                 c.log = restored_log;
                 tracing::info!(node=id, term, log_len=c.log.len(), log_offset=log::offset(&c.log), "Restored from persistence");
             }
@@ -196,7 +192,7 @@ impl Raft {
     }
 
     fn persist(&self, core: &mut RaftState) {
-        let data = encode(core.term, core.voted_for, &core.log);
+        let data = encode(core.term, core.voted_for, &core.log, &core.debug_log);
         self.persister.lock().unwrap().save_raft_state(data);
     }
 

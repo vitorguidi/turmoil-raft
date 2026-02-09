@@ -1,5 +1,6 @@
 use serde::{Serialize, Deserialize};
 use crate::pb::raft::LogEntry;
+use std::collections::BTreeMap;
 
 /// Serializable persistent state (Figure 2: currentTerm, votedFor, log[]).
 ///
@@ -10,6 +11,7 @@ struct PersistentState {
     current_term: u64,
     voted_for: Option<u64>,
     log: Vec<(u64, u64, Vec<u8>)>, // (index, term, command)
+    debug_log: BTreeMap<u64, Vec<u8>>,
 }
 
 /// In-memory persistence that survives simulated crashes.
@@ -53,20 +55,21 @@ impl Persister {
 }
 
 /// Encode persistent Raft state (term, voted_for, log) to bytes.
-pub fn encode(current_term: u64, voted_for: Option<u64>, log: &[LogEntry]) -> Vec<u8> {
+pub fn encode(current_term: u64, voted_for: Option<u64>, log: &[LogEntry], debug_log: &BTreeMap<u64, Vec<u8>>) -> Vec<u8> {
     let state = PersistentState {
         current_term,
         voted_for,
         log: log.iter().map(|e| (e.index, e.term, e.command.clone())).collect(),
+        debug_log: debug_log.clone(),
     };
     bincode::serialize(&state).expect("bincode serialize failed")
 }
 
 /// Decode persistent Raft state from bytes. Returns (term, voted_for, log).
-pub fn decode(data: &[u8]) -> (u64, Option<u64>, Vec<LogEntry>) {
+pub fn decode(data: &[u8]) -> (u64, Option<u64>, Vec<LogEntry>, BTreeMap<u64, Vec<u8>>) {
     let state: PersistentState = bincode::deserialize(data).expect("bincode deserialize failed");
     let log = state.log.into_iter().map(|(index, term, command)| {
         LogEntry { index, term, command }
     }).collect();
-    (state.current_term, state.voted_for, log)
+    (state.current_term, state.voted_for, log, state.debug_log)
 }
