@@ -12,7 +12,7 @@ Inspired by MIT 6.5840 (formerly 6.824).
 | 1 | Leader election | Done |
 | 2 | Log replication | Done |
 | 3 | Persistence & fast backup | Done |
-| 4 | Log compaction / snapshots | Not started |
+| 4 | Log compaction / snapshots | Done |
 | 5 | Fault-tolerant KV service | Done |
 
 ---
@@ -25,16 +25,20 @@ Inspired by MIT 6.5840 (formerly 6.824).
                       │                                              │
   Clerk ──gRPC──────▶ │  KvServer ──RaftMsg::Start──▶ Raft core     │
   (retry loop)        │     │                            │           │
-                      │     │◀── apply_rx (ApplyMsg) ────┘           │
+                      │     │◀── ApplyMsg::Command ──────┘           │
+                      │     │◀── ApplyMsg::Snapshot ─────┘           │
                       │     │                                        │
+                      │     │──RaftMsg::Snapshot──▶ Raft core        │
+                      │     │   (log compaction trigger)             │
                       │     ▼                                        │
                       │  HashMap<K,V>  (state machine)               │
                       │  dup_table     (deduplication)               │
                       │                                              │
                       │  Raft core ──gRPC──▶ Peer Raft cores        │
-                      │     │                                        │
+                      │     │         (AppendEntries / InstallSnapshot)
                       │     ▼                                        │
                       │  Persister (Arc<Mutex<>>)                    │
+                      │  (raft state + snapshot data)                │
                       │  (survives turmoil crash/bounce)             │
                       └──────────────────────────────────────────────┘
 ```
@@ -101,7 +105,7 @@ Raft (private, owned by event loop):
   peers: BTreeMap<u64, RaftClient>
   next_index, match_index        Volatile leader state
   persister: Arc<Mutex<Persister>>
-  apply_tx                       Channel to KV applier
+  apply_tx                       Channel to KV applier (Command + Snapshot)
   received_votes                 Vote counter during elections
 ```
 
@@ -241,6 +245,91 @@ Every operation (get, put, append):
 
 ---
 
+## Log Compaction & Snapshots
+
+### Offset-based Log (`src/raft/log.rs`)
+
+The log is a `Vec<LogEntry>` with a sentinel at position 0. Initially
+`log[0].index == 0`. After a snapshot compacts entries up to index N,
+the log is trimmed and `log[0]` becomes a new sentinel with
+`index = N, term = term_at_N`. All entries before the sentinel are
+discarded — they're covered by the snapshot.
+
+Because vec indices no longer equal Raft log indices, three helpers
+translate between the two:
+
+```
+offset(log)              → log[0].index (first global index)
+vec_index(log, global)   → Some(global - offset) if in range, else None
+entry_at(log, global)    → &log[vec_index] if in range
+```
+
+Every log access in `core.rs` goes through these helpers. Direct
+`core.log[index as usize]` would panic after compaction.
+
+### Snapshot Trigger (KV → Raft)
+
+After applying each committed command, the KV applier checks:
+
+```
+if max_raft_state > 0 && persister.raft_state_size() >= max_raft_state {
+    serialize (store, dup_table) with bincode
+    send RaftMsg::Snapshot { index, data } to Raft
+}
+```
+
+`max_raft_state` controls how large the persisted raft state (log) can
+grow before a snapshot is triggered. Smaller values = more frequent
+snapshots. The fuzzer uses 500–2000 bytes to stress snapshot paths.
+Set to 0 to disable snapshots (raft-only sim).
+
+### Log Compaction (Raft handles RaftMsg::Snapshot)
+
+When Raft receives `RaftMsg::Snapshot { index, data }`:
+
+1. Ignore if `index <= offset` (already compacted past this point)
+2. Look up the term at `index` in the current log
+3. Split the log: keep entries after `index`, replace `log[0]` with a
+   new sentinel `{ index, term }`
+4. Persist both the trimmed raft state and the snapshot data
+
+### InstallSnapshot RPC (Leader → Follower)
+
+In `send_append_entries()`, when the leader detects that a peer's
+`next_index <= log::offset()`, the peer is too far behind for
+AppendEntries — the entries it needs have been compacted away. Instead,
+the leader sends the full snapshot via `InstallSnapshot` RPC:
+
+```
+InstallSnapshotRequest {
+    term, leader_id,
+    last_included_index: offset,
+    last_included_term: log[0].term,
+    data: persister.read_snapshot()
+}
+```
+
+The follower (`handle_install_snapshot_req`):
+1. Checks term (become_follower if higher term)
+2. Skips if `last_included_index <= own offset` (already have it)
+3. Trims own log: keeps entries after the snapshot index if any,
+   otherwise resets to just the new sentinel
+4. Advances `last_applied` and `commit_index` to the snapshot index
+5. Persists raft state + snapshot
+6. Sends `ApplyMsg::Snapshot { data }` to KV applier, which replaces
+   its store and dup_table with the deserialized snapshot
+
+### Snapshot Restore on Boot
+
+In `Raft::new`, after restoring persistent raft state (term, voted_for,
+log), the constructor also reads the snapshot from the persister. If a
+snapshot exists, it sets `commit_index = last_applied = offset` and
+sends `ApplyMsg::Snapshot` to the KV applier. This works because
+`KvServer::new` (which spawns the applier) is called before `Raft::new`
+in the sim setup.
+
+---
+
 ## Persistence (`src/raft/persist.rs`)
 
 Turmoil does not simulate a filesystem. Instead, persistence uses an
@@ -251,16 +340,21 @@ and the test harness. Turmoil preserves host-local `Arc` state across
 **What's persisted** (per Figure 2):
 - `current_term`
 - `voted_for`
-- `log: Vec<LogEntry>` (entire log)
+- `log: Vec<LogEntry>` (post-compaction: only entries after the snapshot)
+- `snapshot: Vec<u8>` (bincode-serialized KV state machine)
 
 **Serialization**: bincode. LogEntry is prost-generated (no serde), so
 entries are converted to `(index, term, command)` tuples for encoding.
+Snapshots are stored as raw bytes via `save_snapshot()`/`read_snapshot()`.
 
 **When persisted**: After every mutation to term, voted_for, or log, and
-before responding to any RPC.
+before responding to any RPC. Snapshot data is persisted alongside raft
+state when log compaction occurs (either from KV trigger or
+InstallSnapshot RPC).
 
-The persister also has `save_snapshot()`/`read_snapshot()` methods, but
-these are not yet used (snapshot support is not implemented).
+`raft_state_size()` returns the byte length of the serialized raft state
+(excluding snapshot). The KV layer uses this to decide when to trigger
+a snapshot.
 
 ---
 
@@ -274,9 +368,9 @@ checks four Raft safety properties after every `sim.step()`:
 | Property | Check |
 |----------|-------|
 | **Election safety** | At most one leader per term (point-in-time snapshot) |
-| **Log matching** | Entries with same (index, term) have identical commands |
-| **State machine safety** | If two servers have applied entry at index N, they applied the same entry |
-| **Leader completeness** | Current leader's log contains all previously committed entries |
+| **Log matching** | Entries with same (index, term) have identical commands (offset-aware: only compares indices present in both logs) |
+| **State machine safety** | If two servers have applied entry at index N, they applied the same entry (skips compacted indices) |
+| **Leader completeness** | Current leader's log contains all previously committed entries (skips indices below leader's snapshot offset) |
 
 Leader completeness ignores "zombie leaders" — nodes with `role == Leader`
 but whose term is less than the highest term in the cluster. These are
@@ -317,6 +411,7 @@ SimConfig {
     crash_probability, bounce_delay,
     election_jitter, election_interval, heartbeat_interval,
     nr_nodes, nr_clients,
+    max_raft_state,  // 0 = no snapshots, >0 = snapshot when raft state exceeds this many bytes
 }
 ```
 
@@ -327,8 +422,8 @@ Same seed + same config = identical execution trace (verified empirically).
 The sim loop (`run_sim_loop` / `run_sim_loop_kv`) injects faults:
 
 - **Crashes**: At each step, with probability `crash_probability`, crash a
-  random node via `sim.crash()`. Reset its volatile state (commit_index,
-  last_applied, role).
+  random node via `sim.crash()`. Reset its volatile state (commit_index
+  and last_applied to the log's snapshot offset, role to Follower).
 - **Bounces**: After `bounce_delay` steps, restart the crashed node via
   `sim.bounce()`. It restores persistent state from the `Persister`.
 - **Quorum preservation**: At most 1 node down at a time (maintains
@@ -387,10 +482,10 @@ issues from killing the fuzz loop.
 
 ## Known Caveats & Limitations
 
-### Snapshots not implemented
-`InstallSnapshot` RPC exists in the proto and has a stub handler, but
-log compaction is not implemented. The log grows unbounded. This is the
-next planned phase.
+### Full snapshots only
+Snapshots are always sent as a single message (no chunking). This is
+fine for simulation (small state), but a production deployment with
+large state machines would need chunked transfer.
 
 ### Dup table grows unbounded
 `KvServer.dup_table` stores the last seq_num and result for every client

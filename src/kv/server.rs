@@ -9,6 +9,7 @@ use tonic::{Request, Response, Status};
 use crate::pb::kv::kv_server::Kv;
 use crate::pb::kv::{GetRequest, GetResponse, PutAppendRequest, PutAppendResponse};
 use crate::raft::core::{ApplyMsg, RaftMsg};
+use crate::raft::persist::Persister;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum KvOp {
@@ -76,6 +77,8 @@ impl KvServer {
     pub fn new(
         raft_tx: mpsc::Sender<RaftMsg>,
         apply_rx: mpsc::Receiver<ApplyMsg>,
+        persister: Arc<Mutex<Persister>>,
+        max_raft_state: usize,
     ) -> Self {
         let pending: Arc<Mutex<HashMap<u64, PendingOp>>> = Arc::new(Mutex::new(HashMap::new()));
         let store: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -83,14 +86,17 @@ impl KvServer {
             Arc::new(Mutex::new(HashMap::new()));
 
         let server = Self {
-            raft_tx,
+            raft_tx: raft_tx.clone(),
             pending: pending.clone(),
             store: store.clone(),
             dup_table: dup_table.clone(),
         };
 
         // Spawn the applier loop
-        tokio::spawn(Self::run_applier(apply_rx, pending, store, dup_table));
+        tokio::spawn(Self::run_applier(
+            apply_rx, pending, store, dup_table,
+            raft_tx, persister, max_raft_state,
+        ));
 
         server
     }
@@ -100,6 +106,9 @@ impl KvServer {
         pending: Arc<Mutex<HashMap<u64, PendingOp>>>,
         store: Arc<Mutex<HashMap<String, String>>>,
         dup_table: Arc<Mutex<HashMap<String, (u64, String)>>>,
+        raft_tx: mpsc::Sender<RaftMsg>,
+        persister: Arc<Mutex<Persister>>,
+        max_raft_state: usize,
     ) {
         while let Some(msg) = apply_rx.recv().await {
             match msg {
@@ -148,6 +157,49 @@ impl KvServer {
                                 "Dropping pending op (term mismatch — leadership changed)"
                             );
                             // Oneshot dropped → waiting handler gets RecvError → wrong_leader
+                        }
+                    }
+
+                    // Check if we should trigger a snapshot
+                    if max_raft_state > 0
+                        && persister.lock().unwrap().raft_state_size() >= max_raft_state
+                    {
+                        let snapshot_data = bincode::serialize(&(
+                            store.lock().unwrap().clone(),
+                            dup_table.lock().unwrap().clone(),
+                        ))
+                        .unwrap();
+                        tracing::info!(
+                            index,
+                            raft_state_size = persister.lock().unwrap().raft_state_size(),
+                            max_raft_state,
+                            "Triggering snapshot"
+                        );
+                        let _ = raft_tx
+                            .try_send(RaftMsg::Snapshot {
+                                index,
+                                data: snapshot_data,
+                            });
+                    }
+                }
+                ApplyMsg::Snapshot { data, .. } => {
+                    match bincode::deserialize::<(
+                        HashMap<String, String>,
+                        HashMap<String, (u64, String)>,
+                    )>(&data)
+                    {
+                        Ok((new_store, new_dup)) => {
+                            tracing::info!(
+                                store_keys = new_store.len(),
+                                dup_entries = new_dup.len(),
+                                "Restoring KV state from snapshot"
+                            );
+                            *store.lock().unwrap() = new_store;
+                            *dup_table.lock().unwrap() = new_dup;
+                            pending.lock().unwrap().clear();
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to deserialize snapshot: {}", e);
                         }
                     }
                 }

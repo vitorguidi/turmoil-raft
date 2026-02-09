@@ -21,6 +21,7 @@ use tonic::transport::Endpoint;
 use std::sync::{Arc, Mutex};
 use std::collections::BTreeMap;
 use turmoil_raft::raft::core::{RaftState, Role};
+use turmoil_raft::raft::log;
 use rand::rngs::SmallRng;
 use rand::Rng;
 
@@ -171,8 +172,9 @@ pub fn run_sim_loop(
                  sim.crash(name.as_str());
                  {
                      let mut s = state_handles[victim_idx].lock().unwrap();
-                     s.commit_index = 0;
-                     s.last_applied = 0;
+                     let snap_offset = log::offset(&s.log);
+                     s.commit_index = snap_offset;
+                     s.last_applied = snap_offset;
                      s.role = Role::Follower;
                  }
                  down_nodes.insert(victim_idx, step + config.bounce_delay);
@@ -263,8 +265,9 @@ pub fn run_sim_loop_kv(
                  sim.crash(name.as_str());
                  {
                      let mut s = state_handles[victim_idx].lock().unwrap();
-                     s.commit_index = 0;
-                     s.last_applied = 0;
+                     let snap_offset = log::offset(&s.log);
+                     s.commit_index = snap_offset;
+                     s.last_applied = snap_offset;
                      s.role = Role::Follower;
                  }
                  down_nodes.insert(victim_idx, step + config.bounce_delay);

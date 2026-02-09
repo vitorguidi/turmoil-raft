@@ -14,6 +14,7 @@ pub struct SimConfig {
     pub nr_nodes: u32,
     pub nr_clients: u32,
     pub bounce_delay: u32,
+    pub max_raft_state: usize,
 }
 
 impl Default for SimConfig {
@@ -34,6 +35,7 @@ impl Default for SimConfig {
             nr_nodes: 5,
             nr_clients: 3,
             bounce_delay: 5000,
+            max_raft_state: 0,
         }
     }
 }
@@ -58,6 +60,7 @@ impl SimConfig {
             nr_nodes: rng.gen_range(3..=7),
             nr_clients: rng.gen_range(1..=5),
             bounce_delay: rng.gen_range(1000..10000),
+            max_raft_state: rng.gen_range(500..2000),
         }
     }
 }

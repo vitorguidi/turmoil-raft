@@ -1,6 +1,7 @@
 use turmoil_raft::raft::{
     client::RaftClient,
     core::{Raft, RaftState, Role},
+    log,
     persist::Persister,
     rpc::RaftService,
 };
@@ -70,7 +71,7 @@ fn build_kv_sim(seed: u64) -> (turmoil::Sim<'static>, Vec<Arc<Mutex<RaftState>>>
                 let tx_rpc = tx.clone();
 
                 // Create KV server (spawns applier loop internally)
-                let kv_server = KvServer::new(tx.clone(), apply_rx);
+                let kv_server = KvServer::new(tx.clone(), apply_rx, persister.clone(), 1000);
 
                 tokio::spawn(async move {
                     Server::builder()
@@ -210,8 +211,9 @@ fn kv_linearizability_detsim() -> turmoil::Result {
                 sim.crash(name.as_str());
                 {
                     let mut s = state_handles[i].lock().unwrap();
-                    s.commit_index = 0;
-                    s.last_applied = 0;
+                    let snap_offset = log::offset(&s.log);
+                    s.commit_index = snap_offset;
+                    s.last_applied = snap_offset;
                     s.role = Role::Follower;
                 }
                 let delay = rng.gen_range(BOUNCE_DELAY_MIN..BOUNCE_DELAY_MAX);

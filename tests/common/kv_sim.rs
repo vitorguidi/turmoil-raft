@@ -59,7 +59,7 @@ pub fn run_kv_simulation(config: SimConfig) -> turmoil::Result {
                 let tx_rpc = tx.clone();
 
                 // Create KV server (spawns applier loop internally)
-                let kv_server = KvServer::new(tx.clone(), apply_rx);
+                let kv_server = KvServer::new(tx.clone(), apply_rx, persister.clone(), config.max_raft_state);
 
                 tokio::spawn(async move {
                     Server::builder()
