@@ -28,6 +28,7 @@ pub struct RaftState {
     pub log: Vec<LogEntry>,
     pub commit_index: u64,
     pub last_applied: u64,
+    pub debug_log: BTreeMap<u64, Vec<u8>>,
 }
 
 impl RaftState {
@@ -39,6 +40,7 @@ impl RaftState {
             log: vec![sentinel()],
             commit_index: 0,
             last_applied: 0,
+            debug_log: BTreeMap::new(),
         }
     }
 }
@@ -145,6 +147,11 @@ impl Raft {
                 let mut c = core.lock().unwrap();
                 c.term = term;
                 c.voted_for = voted_for;
+                for e in &restored_log {
+                    if !e.command.is_empty() {
+                        c.debug_log.insert(e.index, e.command.clone());
+                    }
+                }
                 c.log = restored_log;
                 tracing::info!(node=id, term, log_len=c.log.len(), log_offset=log::offset(&c.log), "Restored from persistence");
             }
@@ -157,11 +164,11 @@ impl Raft {
                 c.commit_index = snap_index;
                 c.last_applied = snap_index;
                 tracing::info!(node=id, snap_index, "Restoring snapshot on boot");
-                let _ = apply_tx.try_send(ApplyMsg::Snapshot {
+                apply_tx.try_send(ApplyMsg::Snapshot {
                     index: snap_index,
                     term: c.log[0].term,
                     data: snapshot_data.to_vec(),
-                });
+                }).expect("apply_tx full on boot");
             }
         }
 
@@ -213,7 +220,7 @@ impl Raft {
                     let _ = reply.send(resp);
                 },
                 RaftMsg::InstallSnapshotReq { req, reply } => {
-                    let resp = self.handle_install_snapshot_req(req);
+                    let resp = self.handle_install_snapshot_req(req).await;
                     let _ = reply.send(resp);
                 },
                 RaftMsg::RequestVoteResp { peer_id, resp } => {
@@ -326,6 +333,7 @@ impl Raft {
                     log_changed = true;
                 }
             }
+            core.debug_log.insert(entry.index, entry.command.clone());
         }
 
         if log_changed {
@@ -392,71 +400,83 @@ impl Raft {
         }
     }
 
-    fn handle_install_snapshot_req(&mut self, req: InstallSnapshotRequest) -> InstallSnapshotResponse {
-        let core_arc = self.core.clone();
-        let mut core = core_arc.lock().unwrap();
+    async fn handle_install_snapshot_req(&mut self, req: InstallSnapshotRequest) -> InstallSnapshotResponse {
+        let (term, apply_msg, snapshot_index) = {
+            let core_arc = self.core.clone();
+            let mut core = core_arc.lock().unwrap();
 
-        if req.term < core.term {
-            return InstallSnapshotResponse { term: core.term };
-        }
+            if req.term < core.term {
+                return InstallSnapshotResponse { term: core.term };
+            }
 
-        if req.term > core.term || core.role != Role::Follower {
-            self.become_follower(&mut core, req.term);
-        }
-        self.reset_election_timeout();
+            if req.term > core.term || core.role != Role::Follower {
+                self.become_follower(&mut core, req.term);
+            }
+            self.reset_election_timeout();
 
-        // Already have a snapshot at or past this index
-        if req.last_included_index <= log::offset(&core.log) {
-            tracing::debug!(
-                node = self.id, req_index = req.last_included_index,
-                our_offset = log::offset(&core.log),
-                "Ignoring InstallSnapshot (already have snapshot at or past this index)"
+            // Already have a snapshot at or past this index
+            if req.last_included_index <= log::offset(&core.log) {
+                tracing::debug!(
+                    node = self.id, req_index = req.last_included_index,
+                    our_offset = log::offset(&core.log),
+                    "Ignoring InstallSnapshot (already have snapshot at or past this index)"
+                );
+                return InstallSnapshotResponse { term: core.term };
+            }
+
+            tracing::info!(
+                node = self.id, term = req.term, leader = req.leader_id,
+                last_included_index = req.last_included_index,
+                last_included_term = req.last_included_term,
+                "Installing snapshot from leader"
             );
-            return InstallSnapshotResponse { term: core.term };
-        }
 
-        tracing::info!(
-            node = self.id, term = req.term, leader = req.leader_id,
-            last_included_index = req.last_included_index,
-            last_included_term = req.last_included_term,
-            "Installing snapshot from leader"
-        );
+            // Trim log
+            let new_sentinel = LogEntry {
+                index: req.last_included_index,
+                term: req.last_included_term,
+                command: vec![],
+            };
+            if let Some(vi) = log::vec_index(&core.log, req.last_included_index) {
+                // We have entries past the snapshot point — keep them
+                core.log = core.log.split_off(vi);
+                core.log[0] = new_sentinel;
+            } else {
+                // Our log doesn't extend past the snapshot — reset to just sentinel
+                core.log = vec![new_sentinel];
+            }
 
-        // Trim log
-        let new_sentinel = LogEntry {
-            index: req.last_included_index,
-            term: req.last_included_term,
-            command: vec![],
+            // Update commit_index.
+            // Note: We DO NOT update last_applied yet. We must wait until the snapshot is
+            // actually delivered to the state machine to avoid linearizability violations (stale reads).
+            if core.commit_index < req.last_included_index {
+                core.commit_index = req.last_included_index;
+            }
+
+            // Persist raft state + snapshot
+            self.persist(&mut core);
+            self.persister.lock().unwrap().save_snapshot(req.data.clone());
+
+            (core.term, ApplyMsg::Snapshot {
+                index: req.last_included_index,
+                term: req.last_included_term,
+                data: req.data,
+            }, req.last_included_index)
         };
-        if let Some(vi) = log::vec_index(&core.log, req.last_included_index) {
-            // We have entries past the snapshot point — keep them
-            core.log = core.log.split_off(vi);
-            core.log[0] = new_sentinel;
-        } else {
-            // Our log doesn't extend past the snapshot — reset to just sentinel
-            core.log = vec![new_sentinel];
-        }
-
-        // Advance applied/committed state
-        if core.last_applied < req.last_included_index {
-            core.last_applied = req.last_included_index;
-        }
-        if core.commit_index < req.last_included_index {
-            core.commit_index = req.last_included_index;
-        }
-
-        // Persist raft state + snapshot
-        self.persist(&mut core);
-        self.persister.lock().unwrap().save_snapshot(req.data.clone());
 
         // Send snapshot to KV applier for state machine restoration
-        let _ = self.apply_tx.try_send(ApplyMsg::Snapshot {
-            index: req.last_included_index,
-            term: req.last_included_term,
-            data: req.data,
-        });
+        self.apply_tx.send(apply_msg).await.expect("apply_tx closed");
 
-        InstallSnapshotResponse { term: core.term }
+        // Now that the state machine has the snapshot, we can safely advance last_applied.
+        {
+            let mut core = self.core.lock().unwrap();
+            if core.last_applied < snapshot_index {
+                core.last_applied = snapshot_index;
+                tracing::info!(node = self.id, last_applied = core.last_applied, "Updated last_applied after snapshot install");
+            }
+        }
+
+        InstallSnapshotResponse { term }
     }
 
     /// Handle snapshot from KV server — compact the log.
@@ -604,6 +624,7 @@ impl Raft {
             if let Some(hid) = heartbeat_id {
                 if let Some(acks) = self.heartbeat_acks.get_mut(&hid) {
                     acks.insert(peer_id);
+                    tracing::debug!(node = self.id, heartbeat_id = hid, peer = peer_id, acks = acks.len(), "Received heartbeat ack for ReadIndex");
                     if acks.len() >= self.quorum() {
                         // Quorum reached
                         if let Some(batch) = self.pending_read_batches.remove(&hid) {
@@ -651,6 +672,7 @@ impl Raft {
         }
         let index = log::last_log_index(&core.log) + 1;
         let term = core.term;
+        core.debug_log.insert(index, command.clone());
         core.log.push(LogEntry {
             index,
             term,
@@ -665,6 +687,7 @@ impl Raft {
         let core = self.core.lock().unwrap();
         if core.role != Role::Leader {
             // Drop reply to signal error
+            tracing::warn!(node = self.id, "ReadIndex rejected: not leader");
             return;
         }
         // In a real implementation, we should check if we have committed an entry in the current term.
@@ -689,9 +712,12 @@ impl Raft {
             let entry = match log::entry_at(&core.log, next) {
                 Some(e) => e,
                 None => {
-                    tracing::warn!(node = self.id, index = next, "Entry not in log (compacted?), skipping");
-                    core.last_applied = next;
-                    continue;
+                    let offset = log::offset(&core.log);
+                    // If we are here, it means we need to apply an entry that is not in our log.
+                    // This implies the log was compacted (snapshot) but last_applied wasn't updated,
+                    // OR we have a logic bug where commit_index > log.last_index.
+                    assert!(next >= offset, "Critical: last_applied ({}) < log offset ({}). Log truncated too early!", core.last_applied, offset);
+                    panic!("Entry at index {} not found in log (offset {}, len {}). Commit index is {}.", next, offset, core.log.len(), core.commit_index);
                 }
             };
             match self.apply_tx.try_send(ApplyMsg::Command {
@@ -719,6 +745,7 @@ impl Raft {
         while i < self.waiting_for_apply.len() {
             if last_applied >= self.waiting_for_apply[i].0 {
                 let (ri, tx) = self.waiting_for_apply.remove(i);
+                tracing::info!(node = self.id, read_index = ri, last_applied, "ReadIndex satisfied, replying to client");
                 let _ = tx.send(ri);
             } else {
                 i += 1;
@@ -866,6 +893,9 @@ impl Raft {
                 entries,
                 leader_commit: commit_index,
             };
+            if let Some(hid) = heartbeat_id {
+                 tracing::debug!(node = self.id, peer = peer_id, heartbeat_id = hid, "Sending AppendEntries with heartbeat_id");
+            }
 
             let mut peer = peer.clone();
             let tx = self.tx.clone();

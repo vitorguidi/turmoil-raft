@@ -240,9 +240,11 @@ pub fn run_sim_loop_kv(
         sim.step()?;
         oracle.assert_invariants();
 
+        update_canonical_log(state_handles, &mut canonical_log);
+
         let h = history.lock().unwrap();
         if h.len() > last_history_len {
-            check_linearizability(&h, state_handles, &mut canonical_log);
+            check_linearizability(&h, &canonical_log);
             last_history_len = h.len();
         }
         drop(h);

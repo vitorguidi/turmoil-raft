@@ -121,8 +121,7 @@ use turmoil_raft::raft::persist::Persister;
 ///    value matches the replay.
 /// 4. For every pair (A, B) where A completed before B was invoked (real-time
 ///    ordering), assert A appears before B in the commit log.
-pub fn check_linearizability(
-    history: &[HistoryEntry],
+pub fn update_canonical_log(
     state_handles: &[Arc<Mutex<RaftState>>],
     canonical_log: &mut Vec<Option<KvOp>>,
 ) {
@@ -133,13 +132,6 @@ pub fn check_linearizability(
         .max()
         .unwrap_or(0);
 
-    tracing::info!(
-        best_commit,
-        canonical_len = canonical_log.len(),
-        history_len = history.len(),
-        "Starting linearizability check"
-    );
-
     // 2. Sync canonical_log up to best_commit
     // We assume canonical_log[0] is the sentinel (index 0).
     while (canonical_log.len() as u64) <= best_commit {
@@ -149,9 +141,17 @@ pub fn check_linearizability(
         // Try to find this index in any node's log
         for h in state_handles {
             let s = h.lock().unwrap();
-            if let Some(entry) = log::entry_at(&s.log, next_idx) {
-                found_cmd = Some(entry.command.clone());
-                break;
+            // Only trust entries that this node considers committed.
+            // This prevents reading uncommitted/divergent entries from stale nodes.
+            if s.commit_index >= next_idx {
+                if let Some(entry) = log::entry_at(&s.log, next_idx) {
+                    found_cmd = Some(entry.command.clone());
+                    break;
+                }
+                if let Some(cmd) = s.debug_log.get(&next_idx) {
+                    found_cmd = Some(cmd.clone());
+                    break;
+                }
             }
         }
 
@@ -180,6 +180,17 @@ pub fn check_linearizability(
             }
         }
     }
+}
+
+pub fn check_linearizability(
+    history: &[HistoryEntry],
+    canonical_log: &[Option<KvOp>],
+) {
+    tracing::info!(
+        canonical_len = canonical_log.len(),
+        history_len = history.len(),
+        "Starting linearizability check"
+    );
 
     // 3. Replay canonical log to build state
     let mut ref_store: HashMap<String, String> = HashMap::new();
