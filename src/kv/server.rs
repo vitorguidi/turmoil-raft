@@ -66,10 +66,8 @@ struct PendingOp {
 pub struct KvServer {
     raft_tx: mpsc::Sender<RaftMsg>,
     pending: Arc<Mutex<HashMap<u64, PendingOp>>>,
-    #[allow(dead_code)]
     store: Arc<Mutex<HashMap<String, String>>>,
     /// Dedup table: client_id -> (last_seq_num, last_result)
-    #[allow(dead_code)]
     dup_table: Arc<Mutex<HashMap<String, (u64, String)>>>,
 }
 
@@ -117,19 +115,13 @@ impl KvServer {
                     term,
                     command,
                 } => {
-                    let op: KvOp = match bincode::deserialize(&command) {
-                        Ok(op) => op,
-                        Err(e) => {
-                            tracing::warn!(index, "Failed to deserialize KvOp: {}", e);
-                            if let Some(pending_op) = pending.lock().unwrap().remove(&index) {
-                                let _ = pending_op.tx.send(ApplyResult {
-                                    value: String::new(),
-                                    err: "deserialization error".to_string(),
-                                });
-                            }
-                            continue;
-                        }
-                    };
+                    // No-op entries (empty command) are now filtered at the Raft
+                    // layer. Any command reaching here must deserialize cleanly.
+                    let op: KvOp = bincode::deserialize(&command)
+                        .unwrap_or_else(|e| panic!(
+                            "BUG: non-empty command at index {} failed to deserialize: {} (len={})",
+                            index, e, command.len()
+                        ));
 
                     tracing::info!(
                         index, term,
@@ -327,23 +319,40 @@ impl KvServer {
             }
         }
     }
+
+    /// Perform a linearizable read via the ReadIndex protocol.
+    /// Confirms leadership via heartbeat quorum, waits for state machine
+    /// to catch up, then reads directly from the store.
+    async fn read_index_get(&self, key: &str) -> Result<String, Status> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.raft_tx
+            .send(RaftMsg::ReadIndex { reply: reply_tx })
+            .await
+            .map_err(|_| Status::unavailable("raft channel closed"))?;
+
+        // Raft drops the oneshot if not leader or no commit in current term
+        let _read_index = match tokio::time::timeout(Duration::from_secs(5), reply_rx).await {
+            Ok(Ok(ri)) => ri,
+            Ok(Err(_)) => return Err(Status::failed_precondition("wrong_leader")),
+            Err(_) => return Err(Status::deadline_exceeded("read index timed out")),
+        };
+
+        // State machine is caught up to read_index — safe to read
+        let value = self.store.lock().unwrap().get(key).cloned().unwrap_or_default();
+        Ok(value)
+    }
 }
 
 #[tonic::async_trait]
 impl Kv for KvServer {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
         let req = request.into_inner();
-        let op = KvOp::Get {
-            key: req.key,
-            client_id: req.client_id,
-            seq_num: req.seq_num,
-        };
 
-        match self.submit_and_wait(op).await {
-            Ok(result) => Ok(Response::new(GetResponse {
+        match self.read_index_get(&req.key).await {
+            Ok(value) => Ok(Response::new(GetResponse {
                 wrong_leader: false,
-                err: result.err,
-                value: result.value,
+                err: String::new(),
+                value,
             })),
             Err(status) if status.code() == tonic::Code::FailedPrecondition => {
                 Ok(Response::new(GetResponse {

@@ -725,6 +725,14 @@ impl Raft {
                     panic!("Entry at index {} not found in log (offset {}, len {}). Commit index is {}.", next, offset, core.log.len(), core.commit_index);
                 }
             };
+            // Skip no-op entries (empty command) — these are leader election
+            // sentinels and have no state machine effect. Don't send them to the
+            // KV layer so that deserialization failures there always indicate a
+            // real bug rather than being silently swallowed.
+            if entry.command.is_empty() {
+                core.last_applied = next;
+                continue;
+            }
             match self.apply_tx.try_send(ApplyMsg::Command {
                 index: entry.index,
                 term: entry.term,
