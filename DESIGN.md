@@ -544,3 +544,9 @@ FUZZ_MODE=reproduce FUZZ_FILE=crash-12345.json RUST_LOG=info \
 # k8s fuzzing (requires kind cluster + GCP credentials)
 # See k8s/k8s-deployment.yaml.tmpl for template variables
 ```
+
+## Gotchas
+
+https://github.com/drmingdrmer/consensus-essence/blob/main/src/list/raft-read-index/raft-read-index.md
+
+For linearizable reads, we cannot naively read from leader, otherwise this implies only sequential consistency. We need to implement the proper read protocol as described above (see crashes on v16, they were all about that).
