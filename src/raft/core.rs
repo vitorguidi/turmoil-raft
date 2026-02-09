@@ -334,7 +334,7 @@ impl Raft {
             core.debug_log.insert(entry.index, entry.command.clone());
         }
 
-        if log_changed {
+        if log_changed || !req.entries.is_empty() {
             self.persist(&mut core);
         }
 

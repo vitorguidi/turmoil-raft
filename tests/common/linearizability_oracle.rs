@@ -145,10 +145,16 @@ pub fn update_canonical_log(
             // This prevents reading uncommitted/divergent entries from stale nodes.
             if s.commit_index >= next_idx {
                 let cmd = if let Some(entry) = log::entry_at(&s.log, next_idx) {
-                    Some(entry.command.clone())
+                    // If the entry is the sentinel (offset), it doesn't contain the command.
+                    // We must look elsewhere (debug_log or other nodes).
+                    if entry.index == log::offset(&s.log) {
+                        None
+                    } else {
+                        Some(entry.command.clone())
+                    }
                 } else {
-                    s.debug_log.get(&next_idx).cloned()
-                };
+                    None
+                }.or_else(|| s.debug_log.get(&next_idx).cloned());
 
                 if let Some(c) = cmd {
                     if let Some(ref existing) = found_cmd {
