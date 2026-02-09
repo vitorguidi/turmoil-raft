@@ -1,0 +1,14 @@
+{
+  "seed": 8142354628012121090,
+  "max_steps": 500000,
+  "latency_avg": 27.502752619556215,
+  "network_fail_rate": 0.010557061623008469,
+  "crash_probability": 0.0003614592476805085,
+  "election_jitter": 83,
+  "election_interval": 276,
+  "heartbeat_interval": 92,
+  "nr_nodes": 5,
+  "nr_clients": 2,
+  "bounce_delay": 6291,
+  "max_raft_state": 1604
+}
