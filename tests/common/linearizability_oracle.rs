@@ -106,6 +106,8 @@ impl TracedClerk {
     }
 }
 
+use turmoil_raft::raft::persist::Persister;
+
 /// Verify that the recorded history is linearizable with respect to the
 /// committed Raft log.
 ///
@@ -121,6 +123,7 @@ impl TracedClerk {
 pub fn check_linearizability(
     history: &[HistoryEntry],
     state_handles: &[Arc<Mutex<RaftState>>],
+    persisters: &[Arc<Mutex<Persister>>],
 ) {
     // 1. Find the server with the highest commit_index.
     let (best_idx, best_commit) = state_handles
@@ -135,26 +138,61 @@ pub fn check_linearizability(
 
     let best_state = state_handles[best_idx].lock().unwrap();
     let log = &best_state.log;
+    let log_offset = log[0].index; // log[0] is sentinel, its index is the offset
 
     tracing::info!(
         server = best_idx + 1,
         commit_index = best_commit,
         log_len = log.len(),
+        log_offset,
         history_len = history.len(),
         "Starting linearizability check"
     );
 
     // 2. Replay committed entries with dedup.
+    // Initialize from snapshot if available
     let mut ref_store: HashMap<String, String> = HashMap::new();
     let mut dedup: HashMap<String, u64> = HashMap::new(); // client_id -> last applied seq
+
+    {
+        let p = persisters[best_idx].lock().unwrap();
+        let snap_data = p.read_snapshot();
+        if !snap_data.is_empty() {
+            match bincode::deserialize::<(
+                HashMap<String, String>,
+                HashMap<String, (u64, String)>,
+            )>(snap_data)
+            {
+                Ok((snap_store, snap_dup)) => {
+                    ref_store = snap_store;
+                    // Transform snap_dup (value has result string) to our dedup (just seq)
+                    // Actually, we might need the result if we were validating that too,
+                    // but here we just need seq to skip duplicates.
+                    dedup = snap_dup.into_iter().map(|(k, v)| (k, v.0)).collect();
+                    tracing::info!("Restored state from snapshot for linearizability check");
+                }
+                Err(e) => tracing::error!("Failed to deserialize snapshot for linearizability check: {}", e),
+            }
+        }
+    }
+
     // (client_id, seq_num) -> (commit_order_index, expected_result)
     let mut commit_map: HashMap<(String, u64), (usize, String)> = HashMap::new();
 
-    for i in 1..=best_commit as usize {
-        if i >= log.len() {
+    // Replay log from offset + 1 to commit_index
+    for i in (log_offset + 1)..=best_commit {
+        // Map Raft index 'i' to vec index
+        let vec_idx = (i - log_offset) as usize;
+        if vec_idx >= log.len() {
             break;
         }
-        let entry = &log[i];
+        let entry = &log[vec_idx];
+        
+        // Sanity check
+        if entry.index != i {
+            panic!("Log index mismatch: expected {}, got {}", i, entry.index);
+        }
+
         let op: KvOp = match bincode::deserialize(&entry.command) {
             Ok(op) => op,
             Err(_) => continue, // skip non-KV entries
@@ -198,7 +236,7 @@ pub fn check_linearizability(
         };
 
         dedup.insert(client_id.clone(), seq_num);
-        commit_map.insert((client_id, seq_num), (i, result));
+        commit_map.insert((client_id, seq_num), (i as usize, result));
     }
 
     // 3. Verify result correctness for every history entry.

@@ -49,7 +49,7 @@ impl Oracle {
             for j in (i + 1)..states.len() {
                 let off_i = log::offset(&states[i].log);
                 let off_j = log::offset(&states[j].log);
-                let start = std::cmp::max(off_i, off_j);
+                let start = std::cmp::max(off_i, off_j) + 1; // +1 to skip sentinel (empty command)
 
                 let last_i = log::last_log_index(&states[i].log);
                 let last_j = log::last_log_index(&states[j].log);

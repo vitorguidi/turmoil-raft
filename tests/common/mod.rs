@@ -21,6 +21,7 @@ use tonic::transport::Endpoint;
 use std::sync::{Arc, Mutex};
 use std::collections::BTreeMap;
 use turmoil_raft::raft::core::{RaftState, Role};
+use turmoil_raft::raft::persist::Persister;
 use turmoil_raft::raft::log;
 use rand::rngs::SmallRng;
 use rand::Rng;
@@ -221,6 +222,7 @@ pub async fn run_client_loop(traced: &mut TracedClerk, rng: &mut SmallRng) {
 pub fn run_sim_loop_kv(
     sim: &mut turmoil::Sim<'static>,
     state_handles: &[Arc<Mutex<RaftState>>],
+    persister_handles: &[Arc<Mutex<Persister>>],
     oracle: &Oracle,
     config: &SimConfig,
     rng: Arc<Mutex<SmallRng>>,
@@ -238,7 +240,7 @@ pub fn run_sim_loop_kv(
 
         let h = history.lock().unwrap();
         if h.len() > last_history_len {
-            check_linearizability(&h, state_handles);
+            check_linearizability(&h, state_handles, persister_handles);
             last_history_len = h.len();
         }
         drop(h);

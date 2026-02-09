@@ -34,6 +34,7 @@ pub fn run_kv_simulation(config: SimConfig) -> turmoil::Result {
         .map(|i| format!("server-{}", i))
         .collect();
     let mut state_handles = Vec::new();
+    let mut persister_handles = Vec::new();
 
     for (i, server_name) in servers.iter().enumerate() {
         let servers = servers.clone();
@@ -42,6 +43,7 @@ pub fn run_kv_simulation(config: SimConfig) -> turmoil::Result {
         let persister = Arc::new(Mutex::new(Persister::new()));
         let state = Arc::new(Mutex::new(RaftState::new()));
         state_handles.push(state.clone());
+        persister_handles.push(persister.clone());
 
         let server_name = server_name.clone();
         sim.host(server_name.as_str(), move || {
@@ -135,5 +137,5 @@ pub fn run_kv_simulation(config: SimConfig) -> turmoil::Result {
         });
     }
 
-    run_sim_loop_kv(&mut sim, &state_handles, &oracle, &config, rng, step_clock, history)
+    run_sim_loop_kv(&mut sim, &state_handles, &persister_handles, &oracle, &config, rng, step_clock, history)
 }
