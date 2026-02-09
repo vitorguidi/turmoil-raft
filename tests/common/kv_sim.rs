@@ -137,5 +137,5 @@ pub fn run_kv_simulation(config: SimConfig) -> turmoil::Result {
         });
     }
 
-    run_sim_loop_kv(&mut sim, &state_handles, &persister_handles, &oracle, &config, rng, step_clock, history)
+    run_sim_loop_kv(&mut sim, &state_handles, &oracle, &config, rng, step_clock, history)
 }

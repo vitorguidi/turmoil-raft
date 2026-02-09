@@ -25,6 +25,7 @@ use turmoil_raft::raft::persist::Persister;
 use turmoil_raft::raft::log;
 use rand::rngs::SmallRng;
 use rand::Rng;
+use turmoil_raft::kv::server::KvOp;
 
 pub mod incoming {
     use std::pin::Pin;
@@ -222,7 +223,6 @@ pub async fn run_client_loop(traced: &mut TracedClerk, rng: &mut SmallRng) {
 pub fn run_sim_loop_kv(
     sim: &mut turmoil::Sim<'static>,
     state_handles: &[Arc<Mutex<RaftState>>],
-    persister_handles: &[Arc<Mutex<Persister>>],
     oracle: &Oracle,
     config: &SimConfig,
     rng: Arc<Mutex<SmallRng>>,
@@ -230,6 +230,8 @@ pub fn run_sim_loop_kv(
     history: History,
 ) -> turmoil::Result {
     let mut last_history_len = 0;
+    // Canonical log of committed operations. Index 0 is sentinel (None).
+    let mut canonical_log: Vec<Option<KvOp>> = vec![None];
     let wall_start = std::time::Instant::now();
     let mut down_nodes: BTreeMap<usize, u32> = BTreeMap::new();
 
@@ -240,7 +242,7 @@ pub fn run_sim_loop_kv(
 
         let h = history.lock().unwrap();
         if h.len() > last_history_len {
-            check_linearizability(&h, state_handles, persister_handles);
+            check_linearizability(&h, state_handles, &mut canonical_log);
             last_history_len = h.len();
         }
         drop(h);

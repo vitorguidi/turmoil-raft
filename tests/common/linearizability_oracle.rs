@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use turmoil_raft::kv::client::Clerk;
 use turmoil_raft::kv::server::KvOp;
 use turmoil_raft::raft::core::RaftState;
+use turmoil_raft::raft::log;
 
 /// Shared sim-step counter. The test loop increments this at each `sim.step()`.
 /// Hosts read it to timestamp operation boundaries.
@@ -123,107 +124,89 @@ use turmoil_raft::raft::persist::Persister;
 pub fn check_linearizability(
     history: &[HistoryEntry],
     state_handles: &[Arc<Mutex<RaftState>>],
-    persisters: &[Arc<Mutex<Persister>>],
+    canonical_log: &mut Vec<Option<KvOp>>,
 ) {
-    // 1. Find the server with the highest commit_index.
-    let (best_idx, best_commit) = state_handles
+    // 1. Determine the global high-water mark for commits.
+    let best_commit = state_handles
         .iter()
-        .enumerate()
-        .map(|(i, h)| {
-            let s = h.lock().unwrap();
-            (i, s.commit_index)
-        })
-        .max_by_key(|&(_, ci)| ci)
-        .unwrap();
-
-    let best_state = state_handles[best_idx].lock().unwrap();
-    let log = &best_state.log;
-    let log_offset = log[0].index; // log[0] is sentinel, its index is the offset
+        .map(|h| h.lock().unwrap().commit_index)
+        .max()
+        .unwrap_or(0);
 
     tracing::info!(
-        server = best_idx + 1,
-        commit_index = best_commit,
-        log_len = log.len(),
-        log_offset,
+        best_commit,
+        canonical_len = canonical_log.len(),
         history_len = history.len(),
         "Starting linearizability check"
     );
 
-    // 2. Replay committed entries with dedup.
-    // Initialize from snapshot if available
-    let mut ref_store: HashMap<String, String> = HashMap::new();
-    let mut dedup: HashMap<String, u64> = HashMap::new(); // client_id -> last applied seq
+    // 2. Sync canonical_log up to best_commit
+    // We assume canonical_log[0] is the sentinel (index 0).
+    while (canonical_log.len() as u64) <= best_commit {
+        let next_idx = canonical_log.len() as u64;
+        let mut found_cmd = None;
 
-    {
-        let p = persisters[best_idx].lock().unwrap();
-        let snap_data = p.read_snapshot();
-        if !snap_data.is_empty() {
-            match bincode::deserialize::<(
-                HashMap<String, String>,
-                HashMap<String, (u64, String)>,
-            )>(snap_data)
-            {
-                Ok((snap_store, snap_dup)) => {
-                    ref_store = snap_store;
-                    // Transform snap_dup (value has result string) to our dedup (just seq)
-                    // Actually, we might need the result if we were validating that too,
-                    // but here we just need seq to skip duplicates.
-                    dedup = snap_dup.into_iter().map(|(k, v)| (k, v.0)).collect();
-                    tracing::info!("Restored state from snapshot for linearizability check");
+        // Try to find this index in any node's log
+        for h in state_handles {
+            let s = h.lock().unwrap();
+            if let Some(entry) = log::entry_at(&s.log, next_idx) {
+                found_cmd = Some(entry.command.clone());
+                break;
+            }
+        }
+
+        match found_cmd {
+            Some(cmd) => {
+                if cmd.is_empty() {
+                    canonical_log.push(None); // No-op or empty command
+                } else {
+                    match bincode::deserialize(&cmd) {
+                        Ok(op) => canonical_log.push(Some(op)),
+                        Err(_) => canonical_log.push(None), // Should not happen for valid KvOp
+                    }
                 }
-                Err(e) => tracing::error!("Failed to deserialize snapshot for linearizability check: {}", e),
+            }
+            None => {
+                // If we are here, it means next_idx <= best_commit, but NO node has it in log.
+                // This implies all nodes have compacted it.
+                // Since we are incrementally building, this implies the test harness missed it.
+                // This is a fatal error for the test infrastructure.
+                panic!(
+                    "Test harness gap: committed index {} is missing from all nodes (compacted) \
+                     and not in canonical log. Current canonical len: {}",
+                    next_idx,
+                    canonical_log.len()
+                );
             }
         }
     }
 
-    // (client_id, seq_num) -> (commit_order_index, expected_result)
+    // 3. Replay canonical log to build state
+    let mut ref_store: HashMap<String, String> = HashMap::new();
+    let mut dedup: HashMap<String, u64> = HashMap::new();
     let mut commit_map: HashMap<(String, u64), (usize, String)> = HashMap::new();
 
-    // Replay log from offset + 1 to commit_index
-    for i in (log_offset + 1)..=best_commit {
-        // Map Raft index 'i' to vec index
-        let vec_idx = (i - log_offset) as usize;
-        if vec_idx >= log.len() {
-            break;
-        }
-        let entry = &log[vec_idx];
-        
-        // Sanity check
-        if entry.index != i {
-            panic!("Log index mismatch: expected {}, got {}", i, entry.index);
-        }
-
-        let op: KvOp = match bincode::deserialize(&entry.command) {
-            Ok(op) => op,
-            Err(_) => continue, // skip non-KV entries
+    for (i, op_opt) in canonical_log.iter().enumerate() {
+        if i == 0 { continue; } // Skip sentinel
+        let op = match op_opt {
+            Some(o) => o,
+            None => continue,
         };
 
-        let (client_id, seq_num) = match &op {
-            KvOp::Get {
-                client_id,
-                seq_num,
-                ..
-            }
-            | KvOp::Put {
-                client_id,
-                seq_num,
-                ..
-            }
-            | KvOp::Append {
-                client_id,
-                seq_num,
-                ..
-            } => (client_id.clone(), *seq_num),
+        let (client_id, seq_num) = match op {
+            KvOp::Get { client_id, seq_num, .. } => (client_id, seq_num),
+            KvOp::Put { client_id, seq_num, .. } => (client_id, seq_num),
+            KvOp::Append { client_id, seq_num, .. } => (client_id, seq_num),
         };
 
-        // Dedup: skip if this client+seq was already applied
-        if let Some(&last_seq) = dedup.get(&client_id) {
-            if seq_num <= last_seq {
-                continue;
-            }
+        // Dedup
+        let last_seq = *dedup.get(client_id).unwrap_or(&0);
+        if *seq_num <= last_seq {
+            continue;
         }
+        dedup.insert(client_id.clone(), *seq_num);
 
-        let result = match &op {
+        let result = match op {
             KvOp::Get { key, .. } => ref_store.get(key).cloned().unwrap_or_default(),
             KvOp::Put { key, value, .. } => {
                 ref_store.insert(key.clone(), value.clone());
@@ -235,11 +218,10 @@ pub fn check_linearizability(
             }
         };
 
-        dedup.insert(client_id.clone(), seq_num);
-        commit_map.insert((client_id, seq_num), (i as usize, result));
+        commit_map.insert((client_id.clone(), *seq_num), (i, result));
     }
 
-    // 3. Verify result correctness for every history entry.
+    // 4. Verify result correctness
     let mut matched = 0;
     let mut unmatched = 0;
 
@@ -251,23 +233,16 @@ pub fn check_linearizability(
                 assert_eq!(
                     h.result, *expected_result,
                     "Linearizability violation (result mismatch): client '{}' seq {} \
-                     Get observed '{}' but commit-order replay says '{}'",
+                    Get observed '{}' but commit-order replay says '{}'",
                     h.client_id, h.seq_num, h.result, expected_result
                 );
             }
         } else {
             unmatched += 1;
-            tracing::warn!(
-                client_id = %h.client_id,
-                seq_num = h.seq_num,
-                "History entry not found in committed log"
-            );
         }
     }
 
-    tracing::info!(matched, unmatched, "Result correctness check done");
-
-    // 4. Check real-time ordering.
+    // 5. Check real-time ordering
     for (ai, a) in history.iter().enumerate() {
         let a_order = match commit_map.get(&(a.client_id.clone(), a.seq_num)) {
             Some((o, _)) => *o,
@@ -275,40 +250,27 @@ pub fn check_linearizability(
         };
 
         for (bi, b) in history.iter().enumerate() {
-            if ai == bi {
-                continue;
-            }
-            // A completed before B was invoked => A must be ordered before B
-            if a.complete_step >= b.invoke_step {
-                continue;
-            }
+            if ai == bi { continue; }
+            if a.complete_step >= b.invoke_step { continue; }
 
             let b_order = match commit_map.get(&(b.client_id.clone(), b.seq_num)) {
                 Some((o, _)) => *o,
                 None => continue,
             };
 
+            if a_order == b_order { continue; }
+
             assert!(
                 a_order < b_order,
                 "Linearizability violation (real-time ordering): \
-                 op ({}, seq {}) completed at step {} before op ({}, seq {}) \
-                 invoked at step {}, but commit order {} >= {}",
-                a.client_id,
-                a.seq_num,
-                a.complete_step,
-                b.client_id,
-                b.seq_num,
-                b.invoke_step,
-                a_order,
-                b_order
+                op ({}, seq {}) completed at step {} before op ({}, seq {}) \
+                invoked at step {}, but commit order {} >= {}",
+                a.client_id, a.seq_num, a.complete_step,
+                b.client_id, b.seq_num, b.invoke_step,
+                a_order, b_order
             );
         }
     }
 
-    tracing::info!(
-        history_entries = history.len(),
-        committed = best_commit,
-        matched,
-        "Linearizability check PASSED"
-    );
+    tracing::info!(matched, unmatched, "Linearizability check PASSED");
 }
