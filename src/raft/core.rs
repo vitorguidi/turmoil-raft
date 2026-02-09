@@ -318,7 +318,9 @@ impl Raft {
                 Some(vi) => {
                     if core.log[vi].term != entry.term {
                         // Conflict: truncate from here
+                        let conflict_index = log::offset(&core.log) + vi as u64;
                         core.log.truncate(vi);
+                        core.debug_log.split_off(&conflict_index);
                         core.log.push(entry.clone());
                         log_changed = true;
                     }
@@ -427,6 +429,9 @@ impl Raft {
                 "Installing snapshot from leader"
             );
 
+            // Prune debug_log to remove potentially stale entries covered by the snapshot
+            core.debug_log = core.debug_log.split_off(&(req.last_included_index + 1));
+
             // Trim log
             let new_sentinel = LogEntry {
                 index: req.last_included_index,
@@ -450,8 +455,8 @@ impl Raft {
             }
 
             // Persist raft state + snapshot
-            self.persist(&mut core);
             self.persister.lock().unwrap().save_snapshot(req.data.clone());
+            self.persist(&mut core);
 
             (core.term, ApplyMsg::Snapshot {
                 index: req.last_included_index,
@@ -506,8 +511,8 @@ impl Raft {
             core.log = vec![new_sentinel];
         }
 
-        self.persist(&mut core);
         self.persister.lock().unwrap().save_snapshot(data);
+        self.persist(&mut core);
 
         tracing::info!(
             node = self.id,
@@ -686,8 +691,12 @@ impl Raft {
             tracing::warn!(node = self.id, "ReadIndex rejected: not leader");
             return;
         }
-        // In a real implementation, we should check if we have committed an entry in the current term.
-        // For this exercise, we assume we can proceed.
+        
+        // Ensure we have committed at least one entry in this term (Raft safety for ReadIndex)
+        if log::term_at(&core.log, core.commit_index) != Some(core.term) {
+             tracing::warn!(node = self.id, commit_index=core.commit_index, term=core.term, "ReadIndex rejected: no committed entry in current term");
+             return;
+        }
         
         let read_index = core.commit_index;
         let hid = self.next_heartbeat_id;
@@ -950,7 +959,21 @@ impl Raft {
     fn become_leader(&mut self, core: &mut RaftState) {
         tracing::info!(node = self.id, term = core.term, "Became leader");
         core.role = Role::Leader;
-        let last = log::last_log_index(&core.log);
+
+        // Append no-op entry to ensure we can commit entries from previous terms
+        // and serve ReadIndex safely.
+        let index = log::last_log_index(&core.log) + 1;
+        let term = core.term;
+        core.debug_log.insert(index, vec![]);
+        core.log.push(LogEntry {
+            index,
+            term,
+            command: vec![],
+        });
+        self.persist(core);
+        tracing::info!(node = self.id, index, term, "Appended no-op entry");
+
+        let last = index;
         self.next_index.clear();
         self.match_index.clear();
         for &peer_id in self.peers.keys() {

@@ -138,19 +138,33 @@ pub fn update_canonical_log(
         let next_idx = canonical_log.len() as u64;
         let mut found_cmd = None;
 
-        // Try to find this index in any node's log
-        for h in state_handles {
+        // Check all nodes to ensure consensus on committed entries
+        for (i, h) in state_handles.iter().enumerate() {
             let s = h.lock().unwrap();
             // Only trust entries that this node considers committed.
             // This prevents reading uncommitted/divergent entries from stale nodes.
             if s.commit_index >= next_idx {
-                if let Some(entry) = log::entry_at(&s.log, next_idx) {
-                    found_cmd = Some(entry.command.clone());
-                    break;
-                }
-                if let Some(cmd) = s.debug_log.get(&next_idx) {
-                    found_cmd = Some(cmd.clone());
-                    break;
+                let cmd = if let Some(entry) = log::entry_at(&s.log, next_idx) {
+                    Some(entry.command.clone())
+                } else {
+                    s.debug_log.get(&next_idx).cloned()
+                };
+
+                if let Some(c) = cmd {
+                    if let Some(ref existing) = found_cmd {
+                        if existing != &c {
+                            panic!(
+                                "Safety violation at index {}: Node {} has command {:?}, but previous node had {:?}. Both claim commit.",
+                                next_idx, i + 1, c, existing
+                            );
+                        }
+                    } else {
+                        found_cmd = Some(c);
+                    }
+                } else {
+                    // Node claims commit_index >= next_idx but has no entry in log OR debug_log.
+                    // This implies it lost the entry (e.g. bad snapshot pruning).
+                    panic!("Node {} claims commit_index {} but missing entry at {}", i + 1, s.commit_index, next_idx);
                 }
             }
         }
