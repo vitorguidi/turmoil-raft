@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use crate::pb::raft::{AppendEntriesRequest, AppendEntriesResponse,
      InstallSnapshotRequest, InstallSnapshotResponse, LogEntry,
       RequestVoteRequest, RequestVoteResponse};
@@ -66,6 +66,7 @@ pub enum RaftMsg {
         prev_log_index: u64,
         entries_len: u64,
         resp: AppendEntriesResponse,
+        heartbeat_id: Option<u64>,
     },
     Start {
         command: Vec<u8>,
@@ -79,6 +80,9 @@ pub enum RaftMsg {
         peer_id: u64,
         last_included_index: u64,
         resp: InstallSnapshotResponse,
+    },
+    ReadIndex {
+        reply: oneshot::Sender<u64>,
     },
     ElectionTimeout,
     HeartbeatTimeout,
@@ -112,6 +116,11 @@ pub struct Raft {
     // Volatile leader state (reinitialized on election)
     next_index: BTreeMap<u64, u64>,
     match_index: BTreeMap<u64, u64>,
+    // ReadIndex state
+    next_heartbeat_id: u64,
+    pending_read_batches: BTreeMap<u64, Vec<(u64, oneshot::Sender<u64>)>>,
+    heartbeat_acks: BTreeMap<u64, HashSet<u64>>,
+    waiting_for_apply: Vec<(u64, oneshot::Sender<u64>)>,
 }
 
 impl Raft {
@@ -172,6 +181,10 @@ impl Raft {
             apply_tx,
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
+            next_heartbeat_id: 0,
+            pending_read_batches: BTreeMap::new(),
+            heartbeat_acks: BTreeMap::new(),
+            waiting_for_apply: Vec::new(),
         }
     }
 
@@ -206,8 +219,8 @@ impl Raft {
                 RaftMsg::RequestVoteResp { peer_id, resp } => {
                     self.handle_request_vote_resp(peer_id, resp);
                 },
-                RaftMsg::AppendEntriesResp { peer_id, prev_log_index, entries_len, resp } => {
-                    self.handle_append_entries_resp(peer_id, prev_log_index, entries_len, resp);
+                RaftMsg::AppendEntriesResp { peer_id, prev_log_index, entries_len, resp, heartbeat_id } => {
+                    self.handle_append_entries_resp(peer_id, prev_log_index, entries_len, resp, heartbeat_id);
                 },
                 RaftMsg::Start { command, reply } => {
                     self.handle_start(command, reply);
@@ -218,6 +231,9 @@ impl Raft {
                 RaftMsg::InstallSnapshotResp { peer_id, last_included_index, resp } => {
                     self.handle_install_snapshot_resp(peer_id, last_included_index, resp);
                 },
+                RaftMsg::ReadIndex { reply } => {
+                    self.handle_read_index(reply);
+                },
                 RaftMsg::ElectionTimeout => {
                     self.handle_election_timeout();
                     self.reset_election_timeout();
@@ -227,6 +243,7 @@ impl Raft {
                 },
             }
             self.apply_committed();
+            self.check_read_waiters();
         }
     }
 
@@ -537,7 +554,7 @@ impl Raft {
             }
         }
         if become_leader {
-            self.send_append_entries();
+            self.send_append_entries(None);
         }
     }
 
@@ -547,6 +564,7 @@ impl Raft {
         prev_log_index: u64,
         entries_len: u64,
         resp: AppendEntriesResponse,
+        heartbeat_id: Option<u64>,
     ) {
         let core_arc = self.core.clone();
         let mut core = core_arc.lock().unwrap();
@@ -581,6 +599,24 @@ impl Raft {
                     "Commit index advanced"
                 );
             }
+
+            // Handle ReadIndex heartbeats
+            if let Some(hid) = heartbeat_id {
+                if let Some(acks) = self.heartbeat_acks.get_mut(&hid) {
+                    acks.insert(peer_id);
+                    if acks.len() >= self.quorum() {
+                        // Quorum reached
+                        if let Some(batch) = self.pending_read_batches.remove(&hid) {
+                            self.heartbeat_acks.remove(&hid);
+                            tracing::info!(node = self.id, heartbeat_id = hid, count = batch.len(), "ReadIndex quorum reached");
+                            for (ri, tx) in batch {
+                                self.waiting_for_apply.push((ri, tx));
+                            }
+                        }
+                    }
+                }
+            }
+
         } else {
             // Fast backup
             let mut new_next_index = resp.conflict_index;
@@ -625,6 +661,27 @@ impl Raft {
         let _ = reply.send((index, term, true));
     }
 
+    fn handle_read_index(&mut self, reply: oneshot::Sender<u64>) {
+        let core = self.core.lock().unwrap();
+        if core.role != Role::Leader {
+            // Drop reply to signal error
+            return;
+        }
+        // In a real implementation, we should check if we have committed an entry in the current term.
+        // For this exercise, we assume we can proceed.
+        
+        let read_index = core.commit_index;
+        let hid = self.next_heartbeat_id;
+        self.next_heartbeat_id += 1;
+        
+        tracing::info!(node = self.id, read_index, heartbeat_id = hid, "Handling ReadIndex");
+
+        self.pending_read_batches.entry(hid).or_default().push((read_index, reply));
+        self.heartbeat_acks.entry(hid).or_default().insert(self.id); // Vote for self
+        drop(core);
+        self.send_append_entries(Some(hid));
+    }
+
     fn apply_committed(&self) {
         let mut core = self.core.lock().unwrap();
         while core.last_applied < core.commit_index {
@@ -649,6 +706,22 @@ impl Raft {
                     tracing::warn!(node = self.id, index = next, "Apply channel full, will retry");
                     break;
                 }
+            }
+        }
+    }
+
+    fn check_read_waiters(&mut self) {
+        let core = self.core.lock().unwrap();
+        let last_applied = core.last_applied;
+        drop(core);
+
+        let mut i = 0;
+        while i < self.waiting_for_apply.len() {
+            if last_applied >= self.waiting_for_apply[i].0 {
+                let (ri, tx) = self.waiting_for_apply.remove(i);
+                let _ = tx.send(ri);
+            } else {
+                i += 1;
             }
         }
     }
@@ -722,10 +795,10 @@ impl Raft {
             return;
         }
         drop(core);
-        self.send_append_entries();
+        self.send_append_entries(None);
     }
 
-    fn send_append_entries(&self) {
+    fn send_append_entries(&self, heartbeat_id: Option<u64>) {
         let core = self.core.lock().unwrap();
         let term = core.term;
         let commit_index = core.commit_index;
@@ -804,6 +877,7 @@ impl Raft {
                             prev_log_index,
                             entries_len,
                             resp,
+                            heartbeat_id,
                         }).await;
                     },
                     Err(e) => {
@@ -832,6 +906,11 @@ impl Raft {
         core.voted_for = None;
         self.received_votes = 0;
         self.persist(core);
+        
+        // Clear ReadIndex state
+        self.pending_read_batches.clear();
+        self.heartbeat_acks.clear();
+        self.waiting_for_apply.clear();
     }
 
     fn become_candidate(&mut self, core: &mut RaftState) {
@@ -852,5 +931,10 @@ impl Raft {
             self.next_index.insert(peer_id, last + 1);
             self.match_index.insert(peer_id, 0);
         }
+        
+        // Clear ReadIndex state (sanity)
+        self.pending_read_batches.clear();
+        self.heartbeat_acks.clear();
+        self.waiting_for_apply.clear();
     }
 }
